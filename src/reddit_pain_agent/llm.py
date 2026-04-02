@@ -49,8 +49,24 @@ class LMStudioClient:
         await self._http.aclose()
 
     async def list_models(self) -> list[LLMModelInfo]:
-        response = await self._http.get(f"{self._config.base_url}/models")
-        response.raise_for_status()
+        try:
+            response = await self._http.get(f"{self._config.base_url}/models")
+            response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise LLMClientError(
+                f"LM Studio request timed out after {self._config.request_timeout_seconds:.0f}s while listing models at "
+                f"{self._config.base_url}/models"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise LLMClientError(
+                f"LM Studio returned HTTP {exc.response.status_code} while listing models at "
+                f"{self._config.base_url}/models"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise LLMClientError(
+                f"LM Studio request failed while listing models at {self._config.base_url}/models: "
+                f"{exc.__class__.__name__}"
+            ) from exc
         payload = response.json()
         items = payload.get("data")
         if not isinstance(items, list):
@@ -82,11 +98,27 @@ class LMStudioClient:
         if not selected_model:
             raise LLMClientError("No model configured. Set LLM_MODEL or pass --model.")
 
-        response = await self._http.post(
-            f"{self._config.base_url}/responses",
-            json={"model": selected_model, "input": prompt},
-        )
-        response.raise_for_status()
+        try:
+            response = await self._http.post(
+                f"{self._config.base_url}/responses",
+                json={"model": selected_model, "input": prompt},
+            )
+            response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise LLMClientError(
+                f"LM Studio request timed out after {self._config.request_timeout_seconds:.0f}s while generating with model "
+                f"{selected_model}. Increase LLM_REQUEST_TIMEOUT_SECONDS or reduce prompt size."
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise LLMClientError(
+                f"LM Studio returned HTTP {exc.response.status_code} for model {selected_model}: "
+                f"{_safe_response_preview(exc.response)}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise LLMClientError(
+                f"LM Studio request failed for model {selected_model} at {self._config.base_url}/responses: "
+                f"{exc.__class__.__name__}"
+            ) from exc
         payload = response.json()
         text = extract_response_text(payload)
         if not text:
@@ -120,3 +152,15 @@ def extract_response_text(payload: dict[str, Any]) -> str:
                 if isinstance(text, str) and text.strip():
                     texts.append(text.strip())
     return "\n".join(texts).strip()
+
+
+def _safe_response_preview(response: httpx.Response, max_chars: int = 160) -> str:
+    try:
+        body = response.text.strip()
+    except Exception:
+        body = ""
+    if not body:
+        return "[no response body]"
+    if len(body) > max_chars:
+        return body[:max_chars].strip() + "..."
+    return body

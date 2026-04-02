@@ -25,6 +25,8 @@ from .models import (
     CandidatePost,
     Comment,
     CommentEnrichmentArtifact,
+    ManualImportBundle,
+    ManualImportPost,
     RunManifest,
     SearchRequestSpec,
     Submission,
@@ -66,6 +68,15 @@ class RetrievalQualityFilters:
     filter_nsfw: bool = False
     allowed_subreddits: tuple[str, ...] = ()
     denied_subreddits: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ManualImportResult:
+    search_result: SearchRunResult
+    comments_result: CommentEnrichmentResult
+    raw_manual_artifacts: list[str]
+    imported_submission_count: int
+    commented_submission_count: int
 
 
 QUERY_EXPANSION_STOPWORDS = {
@@ -453,6 +464,200 @@ async def run_search_command(
     return result
 
 
+def import_manual_search_bundle(
+    *,
+    input_path: Path,
+    output_root: Path,
+    subreddits: list[str],
+    queries: list[str],
+    sort: str = DEFAULT_SORT,
+    time_filter: str = DEFAULT_TIME_FILTER,
+    limit: int = DEFAULT_LIMIT,
+    min_score: int = 0,
+    min_comments: int = 0,
+    filter_nsfw: bool = False,
+    allowed_subreddits: list[str] | None = None,
+    denied_subreddits: list[str] | None = None,
+    output_dir: Path | None = None,
+) -> ManualImportResult:
+    quality_filters = build_retrieval_quality_filters(
+        min_score=min_score,
+        min_comments=min_comments,
+        filter_nsfw=filter_nsfw,
+        allowed_subreddits=allowed_subreddits,
+        denied_subreddits=denied_subreddits,
+    )
+    run_slug = build_search_run_slug(subreddits, queries)
+    store = build_artifact_store(output_root, run_slug, output_dir)
+    bundle, raw_payload = load_manual_import_bundle(input_path)
+    raw_manual_artifacts = [
+        store.write_raw_manual_payload(input_path.stem or "manual-input", raw_payload)
+    ]
+
+    manifest = RunManifest(
+        run_slug=run_slug,
+        status="running",
+        started_at=datetime.now(UTC),
+        output_dir=str(store.run_dir),
+        retrieval_mode="manual",
+        manual_input_path=str(input_path),
+        subreddits=subreddits,
+        queries=queries,
+        query_variants=_dedupe_preserve_order(queries),
+        search_sorts=[sort] if sort else [],
+        search_time_filters=[time_filter] if time_filter else [],
+        min_score=quality_filters.min_score,
+        min_comments=quality_filters.min_comments,
+        filter_nsfw=quality_filters.filter_nsfw,
+        allowed_subreddits=list(quality_filters.allowed_subreddits),
+        denied_subreddits=list(quality_filters.denied_subreddits),
+        sort=sort,
+        time_filter=time_filter,
+        limit=limit,
+        pages_per_query=0,
+        request_timeout_seconds=0.0,
+        max_retries=0,
+        max_concurrent_requests=0,
+        raw_manual_artifacts=raw_manual_artifacts,
+        warnings=[
+            "This run was imported from manual or Playwright-collected input, not Reddit API search.",
+            "Comment retrieval is not needed when imported posts already include saved comments.",
+            "Ranking, clustering, summary, and memo synthesis remain explicit downstream stages.",
+            "Stored post and comment text should be treated as inspectable run data, not permanent archival data.",
+        ],
+    )
+    store.write_manifest(manifest)
+
+    filtered = Counter()
+    candidates_by_id: dict[str, CandidatePost] = {}
+    comments_by_submission: dict[str, list[Comment]] = {}
+
+    for index, post in enumerate(bundle.posts, start=1):
+        submission = Submission(
+            id=post.id,
+            title=post.title,
+            subreddit=post.subreddit,
+            url=post.url,
+            permalink=_normalize_permalink(post.permalink),
+            score=post.score,
+            num_comments=post.num_comments,
+            created_utc=post.created_utc,
+            selftext=post.selftext,
+            author=post.author,
+            over_18=post.over_18,
+        )
+        if _is_deleted_submission(submission):
+            filtered["deleted"] += 1
+            continue
+        if _is_empty_submission(submission):
+            filtered["empty"] += 1
+            continue
+        candidate, comments = normalize_manual_import_post(
+            post,
+            queries=queries,
+            subreddits=subreddits,
+            sort=sort,
+            time_filter=time_filter,
+            request_name=f"manual:{input_path.name}:{index:03d}",
+        )
+        reason = apply_candidate_quality_filters(candidate, quality_filters)
+        if reason:
+            filtered[reason] += 1
+            continue
+        existing = candidates_by_id.get(candidate.id)
+        if existing is None:
+            candidates_by_id[candidate.id] = candidate
+            if comments:
+                comments_by_submission[candidate.id] = comments
+            continue
+        filtered["duplicate"] += 1
+        _merge_candidate(existing, candidate)
+        if comments:
+            existing_comments = comments_by_submission.setdefault(candidate.id, [])
+            seen_comment_ids = {item.id for item in existing_comments}
+            for comment in comments:
+                if comment.id and comment.id not in seen_comment_ids:
+                    existing_comments.append(comment)
+                    seen_comment_ids.add(comment.id)
+
+    candidates = sorted(
+        candidates_by_id.values(),
+        key=lambda item: ((item.num_comments or 0), (item.score or 0), (item.created_utc or 0)),
+        reverse=True,
+    )
+    store.write_candidate_posts(candidates)
+
+    normalized_comment_artifacts: list[str] = []
+    total_comment_count = 0
+    commented_submission_count = 0
+    for candidate in candidates:
+        comments = comments_by_submission.get(candidate.id, [])
+        if not comments:
+            continue
+        sorted_comments = sorted(
+            comments,
+            key=lambda item: ((item.score or 0), -(item.depth or 0)),
+            reverse=True,
+        )
+        artifact = SubmissionCommentsArtifact(
+            submission_id=candidate.id,
+            subreddit=candidate.subreddit,
+            permalink=candidate.permalink,
+            title=candidate.title,
+            fetched_comment_count=len(sorted_comments),
+            comments=sorted_comments,
+        )
+        normalized_comment_artifacts.append(store.write_submission_comments(artifact))
+        total_comment_count += len(sorted_comments)
+        commented_submission_count += 1
+
+    comment_enrichment = CommentEnrichmentArtifact(
+        run_dir=str(store.run_dir),
+        generated_at=datetime.now(UTC),
+        requested_submission_count=len(candidates),
+        fetched_submission_count=commented_submission_count,
+        comment_count=total_comment_count,
+        morechildren_request_count=0,
+        normalized_comment_artifacts=normalized_comment_artifacts,
+    )
+    store.write_comment_enrichment_json(comment_enrichment.model_dump(mode="json"))
+
+    manifest.status = "completed"
+    manifest.completed_at = datetime.now(UTC)
+    manifest.request_count = 0
+    manifest.candidate_count = len(candidates)
+    manifest.filtered_counts = dict(filtered)
+    store.write_manifest(manifest)
+
+    return ManualImportResult(
+        search_result=SearchRunResult(
+            run_slug=manifest.run_slug,
+            run_dir=store.run_dir,
+            request_count=0,
+            candidate_count=len(candidates),
+            query_variant_count=len(manifest.query_variants),
+            search_spec_count=0,
+            sort_count=len(manifest.search_sorts),
+            time_filter_count=len(manifest.search_time_filters),
+            pages_per_query=0,
+            filtered_counts=dict(filtered),
+            raw_search_artifacts=[],
+        ),
+        comments_result=CommentEnrichmentResult(
+            run_dir=store.run_dir,
+            requested_submission_count=len(candidates),
+            fetched_submission_count=commented_submission_count,
+            comment_count=total_comment_count,
+            morechildren_request_count=0,
+            raw_comment_artifacts=[],
+            normalized_comment_artifacts=normalized_comment_artifacts,
+        ),
+        raw_manual_artifacts=raw_manual_artifacts,
+        imported_submission_count=len(bundle.posts),
+        commented_submission_count=commented_submission_count,
+    )
+
+
 async def _execute_specs(
     client: RedditClient,
     specs: list[SearchRequestSpec],
@@ -594,6 +799,60 @@ def normalize_candidate(
     ), ""
 
 
+def load_manual_import_bundle(input_path: Path) -> tuple[ManualImportBundle, Any]:
+    raw_payload = json.loads(input_path.read_text(encoding="utf-8"))
+    payload = {"posts": raw_payload} if isinstance(raw_payload, list) else raw_payload
+    return ManualImportBundle.model_validate(payload), raw_payload
+
+
+def normalize_manual_import_post(
+    post: ManualImportPost,
+    *,
+    queries: list[str],
+    subreddits: list[str],
+    sort: str,
+    time_filter: str,
+    request_name: str,
+) -> tuple[CandidatePost, list[Comment]]:
+    normalized_subreddit = _normalize_subreddit_name(post.subreddit)
+    source_queries = _dedupe_preserve_order(post.source_queries or list(queries))
+    source_subreddits = _dedupe_preserve_order(
+        [_normalize_subreddit_name(value) for value in (post.source_subreddits or [normalized_subreddit, *subreddits])]
+    )
+    source_sorts = _dedupe_preserve_order(post.source_sorts or ([sort] if sort else []))
+    source_time_filters = _dedupe_preserve_order(
+        post.source_time_filters or ([time_filter] if time_filter else [])
+    )
+    retrieval_requests = _dedupe_preserve_order(
+        post.retrieval_requests or [request_name]
+    )
+    return (
+        CandidatePost(
+            id=post.id,
+            title=post.title,
+            subreddit=normalized_subreddit,
+            url=post.url,
+            permalink=_normalize_permalink(post.permalink),
+            score=post.score,
+            num_comments=post.num_comments,
+            created_utc=post.created_utc,
+            selftext=post.selftext,
+            author=post.author,
+            over_18=post.over_18,
+            source_queries=source_queries,
+            source_subreddits=source_subreddits,
+            source_sorts=source_sorts,
+            source_time_filters=source_time_filters,
+            retrieval_requests=retrieval_requests,
+        ),
+        [
+            comment.model_copy(update={"permalink": _normalize_permalink(comment.permalink)})
+            for comment in post.comments
+            if comment.id and comment.body.strip()
+        ],
+    )
+
+
 def expand_query_variants(query: str) -> list[str]:
     normalized = _normalize_query_text(query)
     if not normalized:
@@ -716,12 +975,19 @@ def _normalize_query_text(query: str) -> str:
 def _normalize_subreddit_filters(values: list[str]) -> list[str]:
     normalized: list[str] = []
     for value in values:
-        normalized_value = str(value).strip().lower()
+        normalized_value = _normalize_subreddit_name(value).lower()
         if not normalized_value:
             continue
         if normalized_value not in normalized:
             normalized.append(normalized_value)
     return normalized
+
+
+def _normalize_subreddit_name(value: object) -> str:
+    normalized = str(value or "").strip()
+    if normalized.lower().startswith("r/"):
+        normalized = normalized[2:]
+    return normalized.strip()
 
 
 def _resolve_search_values(

@@ -10,6 +10,8 @@ import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import httpx
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from reddit_pain_agent.artifact_store import build_artifact_store
@@ -20,8 +22,8 @@ from reddit_pain_agent.clustering import (
     load_strongest_cluster_posts,
     validate_cluster_evidence,
 )
-from reddit_pain_agent.config import ConfigurationError, load_llm_config, load_runtime_config
-from reddit_pain_agent.llm import extract_response_text
+from reddit_pain_agent.config import ConfigurationError, LLMConfig, load_llm_config, load_runtime_config
+from reddit_pain_agent.llm import LLMClientError, LMStudioClient, extract_response_text
 from reddit_pain_agent.main import main
 from reddit_pain_agent.memo_writer import (
     build_final_memo_markdown,
@@ -32,6 +34,7 @@ from reddit_pain_agent.memo_writer import (
 from reddit_pain_agent.models import (
     CandidatePost,
     Comment,
+    ManualImportPost,
     RankedCandidatePost,
     RunManifest,
     SearchRequestSpec,
@@ -45,6 +48,13 @@ from reddit_pain_agent.pain_analysis import (
     load_summary_posts,
     score_comment_for_evidence,
     select_comment_evidence,
+)
+from reddit_pain_agent.playwright_capture import (
+    SearchResultPreview,
+    build_reddit_search_urls,
+    capture_reddit_threads,
+    merge_captured_posts,
+    select_search_results,
 )
 from reddit_pain_agent.prompts import build_candidate_evidence_prompt, build_final_memo_prompt
 from reddit_pain_agent.ranking import (
@@ -62,6 +72,7 @@ from reddit_pain_agent.retrieval import (
     build_retrieval_quality_filters,
     expand_query_variants,
     enrich_run_with_comments,
+    import_manual_search_bundle,
     normalize_candidate,
     normalize_comments_payload,
     normalize_morechildren_payload,
@@ -223,6 +234,13 @@ class ArtifactStoreTests(unittest.TestCase):
             self.assertTrue((store.run_dir / raw_path).exists())
             self.assertTrue((store.run_dir / normalized_path).exists())
             self.assertTrue(store.comment_enrichment_json_path.exists())
+
+    def test_artifact_store_writes_manual_raw_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = build_artifact_store(Path(tmpdir), "run-manual")
+            raw_path = store.write_raw_manual_payload("playwright-capture", {"posts": []})
+
+            self.assertTrue((store.run_dir / raw_path).exists())
 
     def test_artifact_store_writes_ranking_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -849,6 +867,323 @@ class RetrievalNormalizationTests(unittest.TestCase):
             self.assertTrue(manifest_payload["filter_nsfw"])
             self.assertEqual(manifest_payload["denied_subreddits"], ["vibecoding"])
 
+    def test_import_manual_search_bundle_writes_candidate_and_comment_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "manual.json"
+            _write_json_file(
+                input_path,
+                {
+                    "posts": [
+                        {
+                            "id": "dup123",
+                            "title": "Spreadsheet lead follow-up keeps breaking",
+                            "subreddit": "Entrepreneur",
+                            "url": "https://reddit.com/dup123",
+                            "permalink": "/r/Entrepreneur/comments/dup123/example/",
+                            "score": 22,
+                            "num_comments": 9,
+                            "selftext": "Still doing reminders by hand.",
+                            "comments": [
+                                {
+                                    "id": "c1",
+                                    "body": "Exact same issue here",
+                                    "score": 5,
+                                    "depth": 0,
+                                }
+                            ],
+                        },
+                        {
+                            "id": "dup123",
+                            "title": "Duplicate surfaced in another manual search",
+                            "subreddit": "Entrepreneur",
+                            "url": "https://reddit.com/dup123",
+                            "score": 24,
+                            "num_comments": 10,
+                            "selftext": "Duplicate record",
+                        },
+                        {
+                            "id": "low-comments",
+                            "title": "Weak discussion",
+                            "subreddit": "Entrepreneur",
+                            "url": "https://reddit.com/low-comments",
+                            "score": 30,
+                            "num_comments": 1,
+                            "selftext": "Too thin",
+                        },
+                    ]
+                },
+            )
+            run_dir = Path(tmpdir) / "run-manual"
+
+            result = import_manual_search_bundle(
+                input_path=input_path,
+                output_root=Path(tmpdir),
+                subreddits=["Entrepreneur"],
+                queries=["manual follow-up pain"],
+                sort="comments",
+                time_filter="month",
+                min_comments=3,
+                output_dir=run_dir,
+            )
+
+            self.assertEqual(result.imported_submission_count, 3)
+            self.assertEqual(result.search_result.candidate_count, 1)
+            self.assertEqual(result.search_result.filtered_counts, {"duplicate": 1, "low_comments": 1})
+            self.assertEqual(result.commented_submission_count, 1)
+            self.assertEqual(result.comments_result.comment_count, 1)
+            self.assertTrue((run_dir / "candidate_posts.json").exists())
+            self.assertTrue((run_dir / "comment_enrichment.json").exists())
+            self.assertTrue((run_dir / "comments" / "dup123.json").exists())
+            self.assertTrue((run_dir / result.raw_manual_artifacts[0]).exists())
+            manifest_payload = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest_payload["retrieval_mode"], "manual")
+            self.assertEqual(manifest_payload["manual_input_path"], str(input_path))
+            self.assertEqual(manifest_payload["raw_manual_artifacts"], result.raw_manual_artifacts)
+
+    def test_import_manual_search_bundle_accepts_userscript_export_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "userscript.json"
+            _write_json_file(
+                input_path,
+                {
+                    "meta": {
+                        "mode": "posts_with_full_content_and_comments",
+                        "scraped_at": "2026-04-02T15:00:00Z",
+                    },
+                    "posts": [
+                        {
+                            "post_id": "abc123",
+                            "title": "Manual follow-up still breaks our spreadsheet CRM",
+                            "subreddit": "r/Entrepreneur",
+                            "permalink": "https://www.reddit.com/r/Entrepreneur/comments/abc123/example/",
+                            "score": 41,
+                            "comments": 18,
+                            "created": "2026-04-02T14:00:00Z",
+                            "body_full": "We still track follow-ups in a spreadsheet and things slip.",
+                            "comments_full": [
+                                {
+                                    "comment_id": "c1",
+                                    "body": "Same problem here. We still do this manually every day.",
+                                    "author": "alice",
+                                    "depth": 0,
+                                    "created": "2026-04-02T14:10:00Z",
+                                    "permalink": "https://www.reddit.com/r/Entrepreneur/comments/abc123/example/c1/",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+            run_dir = Path(tmpdir) / "run-userscript"
+
+            result = import_manual_search_bundle(
+                input_path=input_path,
+                output_root=Path(tmpdir),
+                subreddits=["Entrepreneur"],
+                queries=["manual follow-up pain"],
+                sort="comments",
+                time_filter="month",
+                output_dir=run_dir,
+            )
+
+            self.assertEqual(result.search_result.candidate_count, 1)
+            candidate_payload = json.loads((run_dir / "candidate_posts.json").read_text(encoding="utf-8"))
+            self.assertEqual(candidate_payload[0]["id"], "abc123")
+            self.assertEqual(candidate_payload[0]["subreddit"], "Entrepreneur")
+            self.assertEqual(
+                candidate_payload[0]["selftext"],
+                "We still track follow-ups in a spreadsheet and things slip.",
+            )
+            comment_payload = json.loads((run_dir / "comments" / "abc123.json").read_text(encoding="utf-8"))
+            self.assertEqual(comment_payload["comments"][0]["id"], "c1")
+            self.assertEqual(
+                comment_payload["comments"][0]["body"],
+                "Same problem here. We still do this manually every day.",
+            )
+
+
+class PlaywrightCaptureTests(unittest.TestCase):
+    def test_build_reddit_search_urls_composes_subreddits_and_queries(self) -> None:
+        urls = build_reddit_search_urls(
+            subreddits=["Entrepreneur", "sales"],
+            queries=["manual follow-up pain"],
+            sort="comments",
+            time_filter="month",
+        )
+
+        self.assertEqual(
+            urls,
+            [
+                "https://www.reddit.com/r/Entrepreneur/search/?q=manual+follow-up+pain&sort=comments&t=month&type=link",
+                "https://www.reddit.com/r/sales/search/?q=manual+follow-up+pain&sort=comments&t=month&type=link",
+            ],
+        )
+
+    def test_select_search_results_supports_top_n_and_explicit_indices(self) -> None:
+        previews = [
+            SearchResultPreview(
+                title="A",
+                url="https://www.reddit.com/r/Entrepreneur/comments/a/example",
+                subreddit="Entrepreneur",
+                source_search_url="https://reddit.com/search-1",
+            ),
+            SearchResultPreview(
+                title="B",
+                url="https://www.reddit.com/r/Entrepreneur/comments/b/example",
+                subreddit="Entrepreneur",
+                source_search_url="https://reddit.com/search-1",
+            ),
+            SearchResultPreview(
+                title="B duplicate",
+                url="https://www.reddit.com/r/Entrepreneur/comments/b/example",
+                subreddit="Entrepreneur",
+                source_search_url="https://reddit.com/search-2",
+            ),
+        ]
+
+        top_results = select_search_results(previews, select_results=[], max_posts=2)
+        self.assertEqual([item.title for item in top_results], ["A", "B"])
+
+        explicit_results = select_search_results(previews, select_results=[2], max_posts=3)
+        self.assertEqual([item.title for item in explicit_results], ["B"])
+
+        with self.assertRaises(ValueError):
+            select_search_results(previews, select_results=[4], max_posts=3)
+
+    def test_merge_captured_posts_dedupes_comments_and_preserves_provenance(self) -> None:
+        merged = merge_captured_posts(
+            [
+                ManualImportPost(
+                    id="abc123",
+                    title="Manual follow-up is painful",
+                    subreddit="Entrepreneur",
+                    url="https://reddit.com/a",
+                    score=10,
+                    num_comments=2,
+                    source_queries=["manual follow-up pain"],
+                    source_subreddits=["Entrepreneur"],
+                    source_sorts=["comments"],
+                    source_time_filters=["month"],
+                    retrieval_requests=["playwright:https://reddit.com/a"],
+                    comments=[Comment(id="c1", body="same issue")],
+                ),
+                ManualImportPost(
+                    id="abc123",
+                    title="Manual follow-up is painful",
+                    subreddit="Entrepreneur",
+                    url="https://reddit.com/a",
+                    score=12,
+                    num_comments=3,
+                    source_queries=["spreadsheet crm pain"],
+                    source_subreddits=["Entrepreneur"],
+                    source_sorts=["new"],
+                    source_time_filters=["week"],
+                    retrieval_requests=["playwright:https://reddit.com/a?sort=new"],
+                    comments=[Comment(id="c1", body="same issue"), Comment(id="c2", body="still manual")],
+                ),
+            ]
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].score, 12)
+        self.assertEqual(merged[0].num_comments, 3)
+        self.assertEqual([comment.id for comment in merged[0].comments], ["c1", "c2"])
+        self.assertEqual(
+            merged[0].source_queries,
+            ["manual follow-up pain", "spreadsheet crm pain"],
+        )
+
+    def test_capture_reddit_threads_writes_log_and_snapshots(self) -> None:
+        class FakePage:
+            def __init__(self) -> None:
+                self.current_url = ""
+
+            async def goto(self, url: str, *, wait_until: str, timeout: int):
+                self.current_url = url
+                return None
+
+            async def wait_for_timeout(self, timeout_ms: int):
+                return None
+
+            async def evaluate(self, expression: str):
+                if "/search/" in self.current_url:
+                    return [
+                        {
+                            "url": "https://www.reddit.com/r/Entrepreneur/comments/abc123/example/",
+                            "title": "Manual follow-up is painful",
+                            "subreddit": "Entrepreneur",
+                        }
+                    ]
+                return {
+                    "id": "abc123",
+                    "title": "Manual follow-up is painful",
+                    "subreddit": "Entrepreneur",
+                    "url": "https://www.reddit.com/r/Entrepreneur/comments/abc123/example/",
+                    "permalink": "/r/Entrepreneur/comments/abc123/example/",
+                    "selftext": "Still using spreadsheets.",
+                    "num_comments": 1,
+                    "comments": [
+                        {
+                            "id": "c1",
+                            "body": "Same issue here",
+                            "score": 5,
+                            "depth": 0,
+                        }
+                    ],
+                }
+
+            async def content(self) -> str:
+                return f"<html><body>{self.current_url}</body></html>"
+
+            async def screenshot(self, *, path: str, full_page: bool):
+                Path(path).write_bytes(b"PNG")
+                return None
+
+            async def close(self):
+                return None
+
+        class FakeContext:
+            def __init__(self):
+                self.page = FakePage()
+
+            async def __aenter__(self):
+                return self.page
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "capture.json"
+            with patch(
+                "reddit_pain_agent.playwright_capture._open_playwright_page",
+                return_value=FakeContext(),
+            ):
+                result = asyncio.run(
+                    capture_reddit_threads(
+                        subreddits=["Entrepreneur"],
+                        queries=["manual follow-up pain"],
+                        sort="comments",
+                        time_filter="month",
+                        max_posts=1,
+                        max_comments=5,
+                        output_path=output_path,
+                    )
+                )
+
+            self.assertTrue(output_path.exists())
+            self.assertTrue(result.log_path.exists())
+            self.assertTrue(result.snapshot_dir.exists())
+            self.assertTrue((result.snapshot_dir / "search-001.html").exists())
+            self.assertTrue((result.snapshot_dir / "search-001.png").exists())
+            self.assertTrue((result.snapshot_dir / "thread-001.html").exists())
+            self.assertTrue((result.snapshot_dir / "thread-001.png").exists())
+            self.assertEqual(result.html_snapshot_count, 2)
+            self.assertEqual(result.screenshot_count, 2)
+            self.assertEqual(result.page_error_count, 0)
+            log_text = result.log_path.read_text(encoding="utf-8")
+            self.assertIn('"event": "search_page_extracted"', log_text)
+            self.assertIn('"event": "thread_page_extracted"', log_text)
+
 
 class LLMTests(unittest.TestCase):
     def test_extract_response_text_prefers_output_text(self) -> None:
@@ -867,6 +1202,48 @@ class LLMTests(unittest.TestCase):
             ]
         }
         self.assertEqual(extract_response_text(payload), "First line\nSecond line")
+
+    def test_lmstudio_client_surfaces_timeout_message(self) -> None:
+        async def _run() -> None:
+            async def handler(request: httpx.Request) -> httpx.Response:
+                raise httpx.ReadTimeout("timed out", request=request)
+
+            transport = httpx.MockTransport(handler)
+            config = LLMConfig(
+                provider="lmstudio",
+                base_url="http://127.0.0.1:1234/v1",
+                model="qwen/test",
+                api_key=None,
+                request_timeout_seconds=60.0,
+            )
+            async with LMStudioClient(config, transport=transport) as client:
+                with self.assertRaises(LLMClientError) as ctx:
+                    await client.generate_response("Hello")
+            self.assertIn("timed out after 60s", str(ctx.exception))
+            self.assertIn("qwen/test", str(ctx.exception))
+
+        asyncio.run(_run())
+
+    def test_lmstudio_client_surfaces_http_status_message(self) -> None:
+        async def _run() -> None:
+            async def handler(request: httpx.Request) -> httpx.Response:
+                return httpx.Response(503, json={"error": "model loading"}, request=request)
+
+            transport = httpx.MockTransport(handler)
+            config = LLMConfig(
+                provider="lmstudio",
+                base_url="http://127.0.0.1:1234/v1",
+                model="qwen/test",
+                api_key=None,
+                request_timeout_seconds=60.0,
+            )
+            async with LMStudioClient(config, transport=transport) as client:
+                with self.assertRaises(LLMClientError) as ctx:
+                    await client.generate_response("Hello")
+            self.assertIn("HTTP 503", str(ctx.exception))
+            self.assertIn("model loading", str(ctx.exception))
+
+        asyncio.run(_run())
 
 
 class PromptAndSummaryTests(unittest.TestCase):
@@ -1536,6 +1913,100 @@ class MemoWriterTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_capture_cli_prints_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_result = AsyncMock()
+            fake_result.output_path = Path(tmpdir) / "capture.json"
+            fake_result.log_path = Path(tmpdir) / "capture.log"
+            fake_result.snapshot_dir = Path(tmpdir) / "capture"
+            fake_result.search_url_count = 2
+            fake_result.discovered_thread_count = 7
+            fake_result.selected_thread_count = 3
+            fake_result.captured_post_count = 3
+            fake_result.captured_comment_count = 11
+            fake_result.html_snapshot_count = 5
+            fake_result.screenshot_count = 5
+            fake_result.page_error_count = 1
+            fake_result.selected_thread_urls = [
+                "https://www.reddit.com/r/Entrepreneur/comments/a/example",
+                "https://www.reddit.com/r/Entrepreneur/comments/b/example",
+            ]
+            with patch(
+                "reddit_pain_agent.main.capture_reddit_threads",
+                AsyncMock(return_value=fake_result),
+            ):
+                with patch("sys.stdout.write") as stdout_write:
+                    exit_code = main(
+                        [
+                            "capture",
+                            "--subreddit",
+                            "Entrepreneur",
+                            "--query",
+                            "manual follow-up pain",
+                        ]
+                    )
+
+        self.assertEqual(exit_code, 0)
+        output = "".join(call.args[0] for call in stdout_write.call_args_list)
+        self.assertIn("capture_json:", output)
+        self.assertIn("capture_log:", output)
+        self.assertIn("capture_snapshots:", output)
+        self.assertIn("search_urls: 2", output)
+        self.assertIn("discovered_threads: 7", output)
+        self.assertIn("captured_comments: 11", output)
+        self.assertIn("html_snapshots: 5", output)
+        self.assertIn("screenshots: 5", output)
+        self.assertIn("page_errors: 1", output)
+        self.assertIn("selected_thread_urls:", output)
+
+    def test_capture_cli_handoff_run_builds_manual_input_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            capture_json = Path(tmpdir) / "capture.json"
+            fake_result = AsyncMock()
+            fake_result.output_path = capture_json
+            fake_result.log_path = Path(tmpdir) / "capture.log"
+            fake_result.snapshot_dir = Path(tmpdir) / "capture"
+            fake_result.search_url_count = 1
+            fake_result.discovered_thread_count = 3
+            fake_result.selected_thread_count = 2
+            fake_result.captured_post_count = 2
+            fake_result.captured_comment_count = 4
+            fake_result.html_snapshot_count = 3
+            fake_result.screenshot_count = 3
+            fake_result.page_error_count = 0
+            fake_result.selected_thread_urls = []
+
+            with patch(
+                "reddit_pain_agent.main.capture_reddit_threads",
+                AsyncMock(return_value=fake_result),
+            ), patch(
+                "reddit_pain_agent.main._run_handoff_command",
+                return_value=0,
+            ) as handoff_mock, patch("sys.stdout.write") as stdout_write:
+                exit_code = main(
+                    [
+                        "capture",
+                        "--subreddit",
+                        "Entrepreneur",
+                        "--query",
+                        "manual follow-up pain",
+                        "--handoff",
+                        "run",
+                        "--output-dir",
+                        str(Path(tmpdir) / "run-1"),
+                        "--model",
+                        "openai/gpt-oss-20b",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        handoff_argv = handoff_mock.call_args.args[0]
+        self.assertEqual(handoff_argv[:4], ["run", "--manual-input", str(capture_json), "--output-dir"])
+        self.assertIn("--model", handoff_argv)
+        output = "".join(call.args[0] for call in stdout_write.call_args_list)
+        self.assertIn("handoff: run", output)
+        self.assertIn("handoff_command:", output)
+
     def test_search_cli_prints_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.dict(
@@ -1583,6 +2054,259 @@ class CliTests(unittest.TestCase):
         self.assertIn("pages_per_query: 2", output)
         self.assertIn("candidate_posts: 5", output)
         self.assertIn("filtered: deleted=2, duplicate=1", output)
+
+    def test_manual_import_cli_writes_summary_without_reddit_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "manual.json"
+            _write_json_file(
+                input_path,
+                {
+                    "posts": [
+                        {
+                            "id": "abc123",
+                            "title": "Manual CRM follow-up is still painful",
+                            "subreddit": "Entrepreneur",
+                            "url": "https://reddit.com/abc123",
+                            "score": 17,
+                            "num_comments": 6,
+                            "selftext": "Still using spreadsheets.",
+                            "comments": [{"id": "c1", "body": "Same problem", "score": 4, "depth": 0}],
+                        }
+                    ]
+                },
+            )
+            with patch.dict("os.environ", {}, clear=True):
+                with patch("sys.stdout.write") as stdout_write:
+                    exit_code = main(
+                        [
+                            "manual-import",
+                            "--input",
+                            str(input_path),
+                            "--subreddit",
+                            "Entrepreneur",
+                            "--query",
+                            "manual follow-up pain",
+                            "--output-dir",
+                            str(Path(tmpdir) / "run-manual"),
+                        ]
+                    )
+
+        self.assertEqual(exit_code, 0)
+        output = "".join(call.args[0] for call in stdout_write.call_args_list)
+        self.assertIn("manual_input:", output)
+        self.assertIn("imported_submissions: 1", output)
+        self.assertIn("candidate_posts: 1", output)
+        self.assertIn("saved_comments: 1", output)
+        self.assertIn("comment_enrichment_json:", output)
+
+    def test_run_cli_supports_manual_input_without_reddit_env(self) -> None:
+        class FakeLMStudioClient:
+            def __init__(self, config):
+                self.config = config
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "manual.json"
+            _write_json_file(
+                input_path,
+                {
+                    "posts": [
+                        {
+                            "id": "a",
+                            "title": "Manual follow-up is painful",
+                            "subreddit": "Entrepreneur",
+                            "url": "https://reddit.com/a",
+                            "score": 30,
+                            "num_comments": 12,
+                            "selftext": "Everything still lives in spreadsheets.",
+                            "comments": [{"id": "a1", "body": "Exact same issue", "score": 6, "depth": 0}],
+                        },
+                        {
+                            "id": "b",
+                            "title": "Lead tracking keeps breaking follow-up",
+                            "subreddit": "Entrepreneur",
+                            "url": "https://reddit.com/b",
+                            "score": 28,
+                            "num_comments": 10,
+                            "selftext": "Still doing reminders by hand.",
+                            "comments": [{"id": "b1", "body": "We do this too", "score": 5, "depth": 0}],
+                        },
+                        {
+                            "id": "c",
+                            "title": "CRM setup is too heavy so we stay manual",
+                            "subreddit": "Entrepreneur",
+                            "url": "https://reddit.com/c",
+                            "score": 24,
+                            "num_comments": 8,
+                            "selftext": "Spreadsheet workflow never ends.",
+                            "comments": [{"id": "c1", "body": "Still manual here too", "score": 5, "depth": 0}],
+                        },
+                        {
+                            "id": "d",
+                            "title": "Manual reminders kill our process",
+                            "subreddit": "Entrepreneur",
+                            "url": "https://reddit.com/d",
+                            "score": 23,
+                            "num_comments": 7,
+                            "selftext": "Follow-up depends on copy and paste.",
+                            "comments": [{"id": "d1", "body": "Same pain", "score": 4, "depth": 0}],
+                        },
+                        {
+                            "id": "e",
+                            "title": "Spreadsheet CRM is still our follow-up system",
+                            "subreddit": "Entrepreneur",
+                            "url": "https://reddit.com/e",
+                            "score": 22,
+                            "num_comments": 7,
+                            "selftext": "Every handoff is manual.",
+                            "comments": [{"id": "e1", "body": "I hate this workflow", "score": 4, "depth": 0}],
+                        },
+                    ]
+                },
+            )
+            run_dir = Path(tmpdir) / "run-manual"
+
+            fake_ranking_result = AsyncMock()
+            fake_ranking_result.run_dir = run_dir
+            fake_ranking_result.selected_count = 5
+            fake_ranking_result.candidate_count = 5
+            fake_ranking_result.screened_candidate_count = 5
+            fake_ranking_result.rejected_candidate_count = 0
+            fake_ranking_result.rejection_counts = {}
+
+            fake_cluster_result = AsyncMock()
+            fake_cluster_result.run_dir = run_dir
+            fake_cluster_result.cluster_count = 1
+            fake_cluster_result.strongest_cluster_id = "cluster-1"
+            fake_cluster_result.strongest_post_ids = ["a", "b", "c", "d", "e"]
+            fake_cluster_result.strongest_cluster_complaint_signal_post_count = 5
+            fake_cluster_result.strongest_cluster_screened_post_count = 5
+            fake_cluster_result.evidence_validation_passed = True
+            fake_cluster_result.evidence_failure_reason = None
+
+            fake_summary_artifact = AsyncMock()
+            fake_summary_artifact.run_dir = str(run_dir)
+            fake_summary_artifact.candidate_count = 5
+            fake_summary_artifact.comment_count = 5
+            fake_summary_artifact.selected_comment_count = 5
+            fake_summary_artifact.max_posts_used = 5
+
+            fake_memo_artifact = AsyncMock()
+            fake_memo_artifact.run_dir = str(run_dir)
+            fake_memo_artifact.provider = "lmstudio"
+            fake_memo_artifact.model = "openai/gpt-oss-20b"
+            fake_memo_artifact.strongest_cluster_id = "cluster-1"
+            fake_memo_artifact.strongest_cluster_size = 5
+            fake_memo_artifact.included_post_count = 5
+
+            def fake_rank(*args, **kwargs):
+                _write_json_file(
+                    run_dir / "candidate_screening.json",
+                    {"candidate_count": 5, "kept_count": 5, "rejected_count": 0},
+                )
+                _write_json_file(run_dir / "post_ranking.json", {"candidate_count": 5})
+                _write_json_file(run_dir / "selected_posts.json", [])
+                return fake_ranking_result
+
+            def fake_cluster(*args, **kwargs):
+                _write_json_file(
+                    run_dir / "theme_summary.json",
+                    {
+                        "run_dir": str(run_dir),
+                        "generated_at": "2026-04-02T00:00:00Z",
+                        "source_post_count": 5,
+                        "cluster_count": 1,
+                        "strongest_cluster_id": "cluster-1",
+                        "strongest_post_ids": ["a", "b", "c", "d", "e"],
+                        "clusters": [],
+                    },
+                )
+                _write_json_file(
+                    run_dir / "cluster_evidence_validation.json",
+                    {
+                        "strongest_cluster_id": "cluster-1",
+                        "strongest_cluster_post_count": 5,
+                        "screening_available": True,
+                        "screened_cluster_post_count": 5,
+                        "complaint_signal_post_count": 5,
+                        "min_cluster_complaint_posts": 2,
+                        "passes": True,
+                        "failure_reason": None,
+                    },
+                )
+                return fake_cluster_result
+
+            async def fake_summarize(*args, **kwargs):
+                _write_json_file(run_dir / "comment_selection.json", {"selected_comment_count": 5})
+                _write_json_file(run_dir / "evidence_summary.json", {"summary_text": "summary"})
+                return fake_summary_artifact
+
+            async def fake_memo(*args, **kwargs):
+                _write_json_file(run_dir / "final_memo.json", {"memo_text": "memo"})
+                (run_dir / "final_memo.md").write_text("# Final Memo\n", encoding="utf-8")
+                return fake_memo_artifact
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "LLM_PROVIDER": "lmstudio",
+                    "LLM_BASE_URL": "http://127.0.0.1:1234/v1",
+                    "LLM_MODEL": "openai/gpt-oss-20b",
+                },
+                clear=True,
+            ):
+                with patch(
+                    "reddit_pain_agent.main.load_runtime_config",
+                    side_effect=AssertionError("manual runs should not load Reddit config"),
+                ), patch(
+                    "reddit_pain_agent.main.enrich_run_with_comments",
+                    AsyncMock(side_effect=AssertionError("manual runs should not fetch Reddit comments")),
+                ) as comments_mock, patch(
+                    "reddit_pain_agent.main.rank_run_candidates",
+                    side_effect=fake_rank,
+                ), patch(
+                    "reddit_pain_agent.main.cluster_run_posts",
+                    side_effect=fake_cluster,
+                ), patch(
+                    "reddit_pain_agent.main.summarize_candidate_posts",
+                    AsyncMock(side_effect=fake_summarize),
+                ), patch(
+                    "reddit_pain_agent.main.write_final_memo",
+                    AsyncMock(side_effect=fake_memo),
+                ), patch(
+                    "reddit_pain_agent.main.LMStudioClient",
+                    FakeLMStudioClient,
+                ), patch("sys.stdout.write") as stdout_write:
+                    exit_code = main(
+                        [
+                            "run",
+                            "--manual-input",
+                            str(input_path),
+                            "--output-dir",
+                            str(run_dir),
+                            "--subreddit",
+                            "Entrepreneur",
+                            "--query",
+                            "manual follow-up pain",
+                        ]
+                    )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(comments_mock.await_count, 0)
+            report_payload = json.loads((run_dir / "run_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report_payload["status"], "completed")
+            self.assertEqual(report_payload["stage_reports"][0]["details"]["search_mode"], "manual")
+            self.assertEqual(report_payload["stage_reports"][1]["details"]["source"], "manual_import")
+            output = "".join(call.args[0] for call in stdout_write.call_args_list)
+            self.assertIn("status: completed", output)
+            self.assertIn("requests: 0", output)
+            self.assertIn("saved_comments: 5", output)
+            self.assertIn("run_report_json:", output)
 
     def test_run_cli_orchestrates_pipeline_and_prints_summary(self) -> None:
         class FakeLMStudioClient:

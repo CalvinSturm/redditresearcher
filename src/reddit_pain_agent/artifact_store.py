@@ -12,6 +12,7 @@ class ArtifactStore:
     def __init__(self, run_dir: Path) -> None:
         self.run_dir = run_dir
         self.raw_search_dir = run_dir / "raw" / "search"
+        self.raw_manual_dir = run_dir / "raw" / "manual"
         self.raw_comments_dir = run_dir / "raw" / "comments"
         self.raw_llm_dir = run_dir / "raw" / "llm"
         self.comments_dir = run_dir / "comments"
@@ -32,6 +33,7 @@ class ArtifactStore:
         self.final_memo_markdown_path = run_dir / "final_memo.md"
         self.run_report_json_path = run_dir / "run_report.json"
         self.raw_search_dir.mkdir(parents=True, exist_ok=True)
+        self.raw_manual_dir.mkdir(parents=True, exist_ok=True)
         self.raw_comments_dir.mkdir(parents=True, exist_ok=True)
         self.raw_llm_dir.mkdir(parents=True, exist_ok=True)
         self.comments_dir.mkdir(parents=True, exist_ok=True)
@@ -56,6 +58,11 @@ class ArtifactStore:
             f"-{spec.sort}-{spec.time_filter}.json"
         )
         path = self.raw_search_dir / filename
+        _atomic_write_json(path, payload)
+        return str(path.relative_to(self.run_dir))
+
+    def write_raw_manual_payload(self, name: str, payload: Any) -> str:
+        path = self.raw_manual_dir / f"{_safe_name(name)}.json"
         _atomic_write_json(path, payload)
         return str(path.relative_to(self.run_dir))
 

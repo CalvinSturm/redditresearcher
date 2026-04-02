@@ -10,6 +10,7 @@ from time import perf_counter
 
 from .artifact_store import ArtifactStore
 from .config import (
+    DEFAULT_OUTPUT_ROOT,
     DEFAULT_EXPAND_QUERIES,
     DEFAULT_LIMIT,
     DEFAULT_PAGES_PER_QUERY,
@@ -26,8 +27,14 @@ from .llm import LMStudioClient
 from .memo_writer import write_final_memo
 from .models import RunReportArtifact, RunStageReport
 from .pain_analysis import summarize_candidate_posts
+from .playwright_capture import capture_reddit_threads
 from .ranking import rank_run_candidates
-from .retrieval import enrich_run_with_comments, resolve_search_plan, run_search_command
+from .retrieval import (
+    enrich_run_with_comments,
+    import_manual_search_bundle,
+    resolve_search_plan,
+    run_search_command,
+)
 
 
 STAGE_ORDER = ["search", "comments", "rank", "cluster", "summarize", "memo"]
@@ -108,8 +115,11 @@ def _load_run_report(run_dir: Path) -> RunReportArtifact:
 
 
 def _stage_params_from_args(args: argparse.Namespace) -> dict[str, dict[str, object]]:
+    manual_input = getattr(args, "manual_input", None)
     return {
         "search": {
+            "search_mode": "manual" if manual_input else "api",
+            "manual_input_path": str(manual_input) if manual_input else None,
             "subreddits": list(args.subreddits),
             "queries": list(args.queries),
             "sort": args.sort,
@@ -227,6 +237,8 @@ def _resolve_resume_state(
             next_stage = stage
             break
         previous_params = previous.details.get("params")
+        if stage == "search":
+            previous_params = _normalize_search_stage_params(previous_params)
         if previous_params != params_by_stage[stage]:
             next_stage = stage
             break
@@ -238,6 +250,13 @@ def _resolve_resume_state(
             break
         completed_prefix.append(previous)
     return previous_report, completed_prefix, next_stage
+
+
+def _normalize_search_stage_params(payload: object) -> dict[str, object]:
+    normalized = dict(payload) if isinstance(payload, dict) else {}
+    normalized.setdefault("search_mode", "api")
+    normalized.setdefault("manual_input_path", None)
+    return normalized
 
 
 def _should_run_stage(resumed_from_stage: str | None, stage: str) -> bool:
@@ -284,6 +303,52 @@ def _write_run_report(
     store = ArtifactStore(run_dir)
     store.write_run_report_json(artifact.model_dump(mode="json"))
     return store.run_report_json_path
+
+
+def _run_handoff_command(argv: list[str]) -> int:
+    return main(argv)
+
+
+def _build_capture_handoff_argv(
+    args: argparse.Namespace,
+    capture_output_path: Path,
+) -> list[str]:
+    command = ["manual-import"] if args.handoff == "manual-import" else ["run"]
+    if args.handoff == "manual-import":
+        command.extend(["--input", str(capture_output_path)])
+    else:
+        command.extend(["--manual-input", str(capture_output_path)])
+
+    if args.output_dir is not None:
+        command.extend(["--output-dir", str(args.output_dir)])
+
+    for subreddit in args.subreddits:
+        command.extend(["--subreddit", subreddit])
+    for query in args.queries:
+        command.extend(["--query", query])
+
+    command.extend(["--sort", args.sort, "--time-filter", args.time_filter, "--limit", str(args.limit)])
+
+    if args.min_score:
+        command.extend(["--min-score", str(args.min_score)])
+    if args.min_comments:
+        command.extend(["--min-comments", str(args.min_comments)])
+    if args.filter_nsfw:
+        command.append("--filter-nsfw")
+    for subreddit in args.allowed_subreddits:
+        command.extend(["--allow-subreddit", subreddit])
+    for subreddit in args.denied_subreddits:
+        command.extend(["--deny-subreddit", subreddit])
+
+    if args.handoff == "run":
+        if args.model:
+            command.extend(["--model", args.model])
+        if args.min_cluster_posts != 5:
+            command.extend(["--min-cluster-posts", str(args.min_cluster_posts)])
+        if args.min_cluster_complaint_posts != 2:
+            command.extend(["--min-cluster-complaint-posts", str(args.min_cluster_complaint_posts)])
+
+    return command
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -393,6 +458,149 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional explicit run directory",
     )
 
+    capture_parser = subparsers.add_parser(
+        "capture",
+        help="Use Playwright to capture Reddit search results and thread pages into the manual import schema",
+    )
+    capture_parser.add_argument(
+        "--subreddit",
+        action="append",
+        dest="subreddits",
+        required=True,
+        help="Target subreddit name without the r/ prefix",
+    )
+    capture_parser.add_argument(
+        "--query",
+        action="append",
+        dest="queries",
+        required=True,
+        help="Search query to run within each target subreddit",
+    )
+    capture_parser.add_argument("--sort", default=DEFAULT_SORT, help="Reddit search sort")
+    capture_parser.add_argument(
+        "--time-filter",
+        default=DEFAULT_TIME_FILTER,
+        help="Reddit time filter",
+    )
+    capture_parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        help="Metadata limit to forward if the capture is handed to manual-import or run",
+    )
+    capture_parser.add_argument(
+        "--thread-url",
+        action="append",
+        default=[],
+        dest="thread_urls",
+        help="Optional direct Reddit thread URL to capture in addition to discovered search results",
+    )
+    capture_parser.add_argument(
+        "--select-result",
+        action="append",
+        type=int,
+        default=[],
+        dest="select_results",
+        help="1-based discovered search-result index to capture. Defaults to the top results.",
+    )
+    capture_parser.add_argument(
+        "--max-posts",
+        type=int,
+        default=5,
+        help="Maximum number of thread pages to capture",
+    )
+    capture_parser.add_argument(
+        "--max-comments",
+        type=int,
+        default=12,
+        help="Maximum number of visible comments to save per captured thread",
+    )
+    capture_parser.add_argument(
+        "--page-timeout-seconds",
+        type=float,
+        default=20.0,
+        help="Per-page Playwright navigation timeout",
+    )
+    capture_parser.add_argument(
+        "--page-wait-ms",
+        type=int,
+        default=1000,
+        help="Additional post-navigation wait time before extracting page data",
+    )
+    capture_parser.add_argument(
+        "--show-browser",
+        action="store_true",
+        help="Launch Chromium with a visible window instead of headless mode",
+    )
+    capture_parser.add_argument(
+        "--skip-search",
+        action="store_true",
+        help="Skip subreddit search pages and capture only the provided --thread-url values",
+    )
+    capture_parser.add_argument(
+        "--output-json",
+        type=Path,
+        help="Optional explicit path for the captured import JSON bundle",
+    )
+    capture_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Optional run directory to reuse when handing capture output to manual-import or run",
+    )
+    capture_parser.add_argument(
+        "--handoff",
+        choices=["none", "manual-import", "run"],
+        default="none",
+        help="What to do after capture: stop, import into a run, or execute the full run pipeline",
+    )
+    capture_parser.add_argument(
+        "--min-score",
+        type=int,
+        default=0,
+        help="Minimum Reddit post score required if the capture is handed to manual-import or run",
+    )
+    capture_parser.add_argument(
+        "--min-comments",
+        type=int,
+        default=0,
+        help="Minimum Reddit comment count required if the capture is handed to manual-import or run",
+    )
+    capture_parser.add_argument(
+        "--filter-nsfw",
+        action="store_true",
+        help="Exclude NSFW captured submissions if the bundle is handed to manual-import or run",
+    )
+    capture_parser.add_argument(
+        "--allow-subreddit",
+        action="append",
+        default=[],
+        dest="allowed_subreddits",
+        help="Optional subreddit allowlist to forward into manual-import or run",
+    )
+    capture_parser.add_argument(
+        "--deny-subreddit",
+        action="append",
+        default=[],
+        dest="denied_subreddits",
+        help="Optional subreddit denylist to forward into manual-import or run",
+    )
+    capture_parser.add_argument(
+        "--model",
+        help="Optional model override to forward when handoff=run",
+    )
+    capture_parser.add_argument(
+        "--min-cluster-posts",
+        type=int,
+        default=5,
+        help="Minimum strongest-cluster size to forward when handoff=run",
+    )
+    capture_parser.add_argument(
+        "--min-cluster-complaint-posts",
+        type=int,
+        default=2,
+        help="Minimum strongest-cluster complaint-signal post count to forward when handoff=run",
+    )
+
     run_parser = subparsers.add_parser(
         "run",
         help="Execute the full search-to-memo pipeline for a single run",
@@ -487,6 +695,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="expand_queries",
         action="store_false",
         help="Disable deterministic query expansion and search only the provided queries",
+    )
+    run_parser.add_argument(
+        "--manual-input",
+        type=Path,
+        help="Path to manual or Playwright-collected JSON input to import instead of calling the Reddit API",
     )
     run_parser.add_argument(
         "--output-dir",
@@ -591,6 +804,79 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=5,
         help="Minimum strongest-cluster size required before synthesis proceeds",
+    )
+
+    manual_import_parser = subparsers.add_parser(
+        "manual-import",
+        help="Import manual or Playwright-collected Reddit data into a run directory",
+    )
+    manual_import_parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Path to a JSON file containing manually collected posts and optional comments",
+    )
+    manual_import_parser.add_argument(
+        "--subreddit",
+        action="append",
+        dest="subreddits",
+        required=True,
+        help="Target subreddit name without the r/ prefix",
+    )
+    manual_import_parser.add_argument(
+        "--query",
+        action="append",
+        dest="queries",
+        required=True,
+        help="Seed query metadata to attach to imported posts",
+    )
+    manual_import_parser.add_argument("--sort", default=DEFAULT_SORT, help="Source search sort metadata")
+    manual_import_parser.add_argument(
+        "--time-filter",
+        default=DEFAULT_TIME_FILTER,
+        help="Source time filter metadata",
+    )
+    manual_import_parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        help="Source search limit metadata",
+    )
+    manual_import_parser.add_argument(
+        "--min-score",
+        type=int,
+        default=0,
+        help="Minimum Reddit post score required for an imported candidate to survive filtering",
+    )
+    manual_import_parser.add_argument(
+        "--min-comments",
+        type=int,
+        default=0,
+        help="Minimum Reddit comment count required for an imported candidate to survive filtering",
+    )
+    manual_import_parser.add_argument(
+        "--filter-nsfw",
+        action="store_true",
+        help="Exclude NSFW imported submissions during filtering",
+    )
+    manual_import_parser.add_argument(
+        "--allow-subreddit",
+        action="append",
+        default=[],
+        dest="allowed_subreddits",
+        help="Optional subreddit allowlist applied after manual import normalization",
+    )
+    manual_import_parser.add_argument(
+        "--deny-subreddit",
+        action="append",
+        default=[],
+        dest="denied_subreddits",
+        help="Optional subreddit denylist applied after manual import normalization",
+    )
+    manual_import_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Optional explicit run directory",
     )
 
     comments_parser = subparsers.add_parser(
@@ -822,6 +1108,126 @@ def main(argv: list[str] | None = None) -> int:
             print("filtered: none")
         return 0
 
+    if args.command == "capture":
+        try:
+            if args.max_posts <= 0:
+                raise ValueError("--max-posts must be greater than 0")
+            if args.max_comments < 0:
+                raise ValueError("--max-comments must be 0 or greater")
+            if args.page_timeout_seconds <= 0:
+                raise ValueError("--page-timeout-seconds must be greater than 0")
+            if args.page_wait_ms < 0:
+                raise ValueError("--page-wait-ms must be 0 or greater")
+            if args.min_score < 0:
+                raise ValueError("--min-score must be 0 or greater")
+            if args.min_comments < 0:
+                raise ValueError("--min-comments must be 0 or greater")
+            if args.limit <= 0:
+                raise ValueError("--limit must be greater than 0")
+            if args.skip_search and not args.thread_urls:
+                raise ValueError("--skip-search requires at least one --thread-url")
+
+            output_json = args.output_json
+            if output_json is None and args.output_dir is not None:
+                output_json = args.output_dir / "manual_capture.json"
+
+            result = asyncio.run(
+                capture_reddit_threads(
+                    subreddits=args.subreddits,
+                    queries=args.queries,
+                    sort=args.sort,
+                    time_filter=args.time_filter,
+                    thread_urls=args.thread_urls,
+                    select_results=args.select_results,
+                    max_posts=args.max_posts,
+                    max_comments=args.max_comments,
+                    headless=not args.show_browser,
+                    page_timeout_seconds=args.page_timeout_seconds,
+                    page_wait_ms=args.page_wait_ms,
+                    output_path=output_json,
+                    skip_search=args.skip_search,
+                )
+            )
+        except (ValueError, RuntimeError) as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:
+            print(f"Capture failed: {exc}", file=sys.stderr)
+            return 1
+
+        print(f"capture_json: {result.output_path}")
+        print(f"capture_log: {result.log_path}")
+        print(f"capture_snapshots: {result.snapshot_dir}")
+        print(f"search_urls: {result.search_url_count}")
+        print(f"discovered_threads: {result.discovered_thread_count}")
+        print(f"selected_threads: {result.selected_thread_count}")
+        print(f"captured_posts: {result.captured_post_count}")
+        print(f"captured_comments: {result.captured_comment_count}")
+        print(f"html_snapshots: {result.html_snapshot_count}")
+        print(f"screenshots: {result.screenshot_count}")
+        print(f"page_errors: {result.page_error_count}")
+        if result.selected_thread_urls:
+            print(f"selected_thread_urls: {', '.join(result.selected_thread_urls)}")
+        else:
+            print("selected_thread_urls: none")
+        if args.handoff == "none":
+            return 0
+        handoff_argv = _build_capture_handoff_argv(args, result.output_path)
+        print(f"handoff: {args.handoff}")
+        print(f"handoff_command: {' '.join(handoff_argv)}")
+        return _run_handoff_command(handoff_argv)
+
+    if args.command == "manual-import":
+        try:
+            if args.min_score < 0:
+                raise ValueError("--min-score must be 0 or greater")
+            if args.min_comments < 0:
+                raise ValueError("--min-comments must be 0 or greater")
+            if args.limit <= 0:
+                raise ValueError("--limit must be greater than 0")
+            output_root = args.output_dir.parent if args.output_dir is not None else DEFAULT_OUTPUT_ROOT
+            result = import_manual_search_bundle(
+                input_path=args.input,
+                output_root=output_root,
+                subreddits=args.subreddits,
+                queries=args.queries,
+                sort=args.sort,
+                time_filter=args.time_filter,
+                limit=args.limit,
+                min_score=args.min_score,
+                min_comments=args.min_comments,
+                filter_nsfw=args.filter_nsfw,
+                allowed_subreddits=args.allowed_subreddits,
+                denied_subreddits=args.denied_subreddits,
+                output_dir=args.output_dir,
+            )
+        except ValueError as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:
+            print(f"Manual import failed: {exc}", file=sys.stderr)
+            return 1
+
+        print(f"run_slug: {result.search_result.run_slug}")
+        print(f"output_dir: {result.search_result.run_dir}")
+        print(f"manual_input: {args.input}")
+        print(f"imported_submissions: {result.imported_submission_count}")
+        print(f"candidate_posts: {result.search_result.candidate_count}")
+        print(f"saved_comment_submissions: {result.commented_submission_count}")
+        print(f"saved_comments: {result.comments_result.comment_count}")
+        if result.search_result.filtered_counts:
+            filtered_summary = ", ".join(
+                f"{reason}={count}"
+                for reason, count in sorted(result.search_result.filtered_counts.items())
+            )
+            print(f"filtered: {filtered_summary}")
+        else:
+            print("filtered: none")
+        print(f"candidate_posts_json: {result.search_result.run_dir / 'candidate_posts.json'}")
+        print(f"comment_enrichment_json: {result.search_result.run_dir / 'comment_enrichment.json'}")
+        print(f"raw_manual_artifacts: {', '.join(result.raw_manual_artifacts)}")
+        return 0
+
     if args.command == "run":
         stage_reports: list[RunStageReport] = []
         run_started_at = datetime.now(UTC)
@@ -835,6 +1241,7 @@ def main(argv: list[str] | None = None) -> int:
         current_stage: str | None = None
         current_stage_started: float | None = None
         resumed_from_stage: str | None = None
+        manual_import_result = None
         provider: str | None = None
         model: str | None = None
         stage_params = _stage_params_from_args(args)
@@ -872,7 +1279,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.resume and args.output_dir is None:
                 raise ValueError("--resume requires --output-dir")
 
-            runtime_config = load_runtime_config()
+            runtime_config = None
+            if args.manual_input is None:
+                runtime_config = load_runtime_config()
             search_sorts, search_time_filters = resolve_search_plan(
                 sort=args.sort,
                 time_filter=args.time_filter,
@@ -940,26 +1349,48 @@ def main(argv: list[str] | None = None) -> int:
             current_stage = "search"
             current_stage_started = perf_counter()
             if search_result is None or resumed_from_stage == "search":
-                search_result = asyncio.run(
-                    run_search_command(
-                        config=runtime_config,
+                if args.manual_input is not None:
+                    output_root = (
+                        args.output_dir.parent if args.output_dir is not None else DEFAULT_OUTPUT_ROOT
+                    )
+                    manual_import_result = import_manual_search_bundle(
+                        input_path=args.manual_input,
+                        output_root=output_root,
                         subreddits=args.subreddits,
                         queries=args.queries,
                         sort=args.sort,
                         time_filter=args.time_filter,
-                        additional_sorts=args.additional_sorts,
-                        additional_time_filters=args.additional_time_filters,
                         limit=args.limit,
                         min_score=args.min_score,
                         min_comments=args.min_comments,
                         filter_nsfw=args.filter_nsfw,
                         allowed_subreddits=args.allowed_subreddits,
                         denied_subreddits=args.denied_subreddits,
-                        pages_per_query=args.pages_per_query,
-                        expand_queries=args.expand_queries,
                         output_dir=args.output_dir,
                     )
-                )
+                    search_result = manual_import_result.search_result
+                    comments_result = manual_import_result.comments_result
+                else:
+                    search_result = asyncio.run(
+                        run_search_command(
+                            config=runtime_config,
+                            subreddits=args.subreddits,
+                            queries=args.queries,
+                            sort=args.sort,
+                            time_filter=args.time_filter,
+                            additional_sorts=args.additional_sorts,
+                            additional_time_filters=args.additional_time_filters,
+                            limit=args.limit,
+                            min_score=args.min_score,
+                            min_comments=args.min_comments,
+                            filter_nsfw=args.filter_nsfw,
+                            allowed_subreddits=args.allowed_subreddits,
+                            denied_subreddits=args.denied_subreddits,
+                            pages_per_query=args.pages_per_query,
+                            expand_queries=args.expand_queries,
+                            output_dir=args.output_dir,
+                        )
+                    )
                 stage_reports = [item for item in stage_reports if item.stage != "search"]
                 stage_reports.append(
                     RunStageReport(
@@ -978,6 +1409,18 @@ def main(argv: list[str] | None = None) -> int:
                             "search_time_filters": search_time_filters,
                             "pages_per_query": search_result.pages_per_query,
                             "filtered_counts": search_result.filtered_counts,
+                            "search_mode": "manual" if args.manual_input else "api",
+                            "manual_input_path": str(args.manual_input) if args.manual_input else None,
+                            "raw_manual_artifacts": (
+                                manual_import_result.raw_manual_artifacts
+                                if manual_import_result is not None
+                                else []
+                            ),
+                            "imported_submission_count": (
+                                manual_import_result.imported_submission_count
+                                if manual_import_result is not None
+                                else None
+                            ),
                             "run_dir": str(search_result.run_dir),
                         },
                         artifact_fingerprints=_stage_artifact_fingerprints(
@@ -989,18 +1432,39 @@ def main(argv: list[str] | None = None) -> int:
             current_stage = "comments"
             current_stage_started = perf_counter()
             if _should_run_stage(resumed_from_stage, "comments"):
-                comments_result = asyncio.run(
-                    enrich_run_with_comments(
-                        config=runtime_config,
-                        run_dir=search_result.run_dir,
-                        max_posts=args.comment_max_posts,
-                        comment_limit=args.comment_limit,
-                        comment_depth=args.comment_depth,
-                        comment_sort=args.comment_sort,
-                        max_morechildren_requests=args.max_morechildren_requests,
-                        morechildren_batch_size=args.morechildren_batch_size,
+                if args.manual_input is not None and comments_result is None:
+                    output_root = (
+                        args.output_dir.parent if args.output_dir is not None else DEFAULT_OUTPUT_ROOT
                     )
-                )
+                    manual_import_result = import_manual_search_bundle(
+                        input_path=args.manual_input,
+                        output_root=output_root,
+                        subreddits=args.subreddits,
+                        queries=args.queries,
+                        sort=args.sort,
+                        time_filter=args.time_filter,
+                        limit=args.limit,
+                        min_score=args.min_score,
+                        min_comments=args.min_comments,
+                        filter_nsfw=args.filter_nsfw,
+                        allowed_subreddits=args.allowed_subreddits,
+                        denied_subreddits=args.denied_subreddits,
+                        output_dir=search_result.run_dir,
+                    )
+                    comments_result = manual_import_result.comments_result
+                elif args.manual_input is None:
+                    comments_result = asyncio.run(
+                        enrich_run_with_comments(
+                            config=runtime_config,
+                            run_dir=search_result.run_dir,
+                            max_posts=args.comment_max_posts,
+                            comment_limit=args.comment_limit,
+                            comment_depth=args.comment_depth,
+                            comment_sort=args.comment_sort,
+                            max_morechildren_requests=args.max_morechildren_requests,
+                            morechildren_batch_size=args.morechildren_batch_size,
+                        )
+                    )
                 stage_reports = [item for item in stage_reports if item.stage != "comments"]
                 stage_reports.append(
                     RunStageReport(
@@ -1013,6 +1477,7 @@ def main(argv: list[str] | None = None) -> int:
                             "fetched_submission_count": comments_result.fetched_submission_count,
                             "comment_count": comments_result.comment_count,
                             "morechildren_request_count": comments_result.morechildren_request_count,
+                            "source": "manual_import" if args.manual_input else "reddit_api",
                         },
                         artifact_fingerprints=_stage_artifact_fingerprints(
                             search_result.run_dir,

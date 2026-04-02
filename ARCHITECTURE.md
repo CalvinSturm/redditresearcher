@@ -39,6 +39,7 @@ src/reddit_pain_agent/
   reddit_client.py
   artifact_store.py
   retrieval.py
+  playwright_capture.py
   ranking.py
   clustering.py
   pain_analysis.py
@@ -118,12 +119,28 @@ Owns query expansion and candidate collection:
 * category-to-query expansion
 * multi-subreddit retrieval orchestration
 * paginated subreddit search retrieval
+* manual or Playwright-collected JSON import as a retrieval fallback
 * deterministic search-plan expansion across sorts and time windows
 * candidate normalization
 * deterministic retrieval-quality gating before ranking
 * filtering deleted / empty / low-signal entries with explicit rejection counts
 * explicit comment enrichment for shortlisted submissions
 * bounded `MoreComments` expansion to reduce truncated comment evidence
+
+### `playwright_capture.py`
+
+Owns browser-based capture into the manual import schema:
+
+* Reddit search URL planning for capture
+* Playwright browser lifecycle
+* search-result extraction from Reddit pages
+* thread-page extraction for posts and visible comments
+* deterministic result selection by index
+* JSON bundle persistence for later import or run handoff
+* persistent capture logs and per-page snapshots for debugging extraction failures
+
+This module should remain capture-only.
+It should not rank, cluster, or synthesize.
 
 ### `artifact_store.py`
 
@@ -133,6 +150,7 @@ Owns persisted run artifacts:
 * manifest persistence
 * request log persistence
 * raw response persistence
+* raw manual input persistence
 * normalized artifact writes
 * top-level run report persistence
 
@@ -249,6 +267,14 @@ The current vertical slice exposes explicit stage commands plus an end-to-end `r
 command that orchestrates retrieval, comment enrichment, ranking, clustering,
 summary generation, and final memo writing.
 
+It also exposes a `manual-import` command plus `run --manual-input <path>` so a
+research loop can continue from manually collected or Playwright-collected JSON
+without Reddit API credentials.
+
+It also exposes a `capture` command that can visit Reddit search and thread
+pages with Playwright, write a saved import bundle, and optionally hand that
+bundle straight into `manual-import` or `run --manual-input`.
+
 It also supports resumable runs by consulting `run_report.json`, validating that
 completed-stage artifacts still exist, validating their recorded fingerprints,
 and reusing only the completed stages whose recorded parameters still match the
@@ -283,6 +309,14 @@ Candidate posts with:
 * selftext
 * retrieval provenance
 * selected comment text
+
+When the manual fallback is used, the same normalized retrieval artifacts are
+produced from imported JSON instead of live Reddit API requests.
+
+When the Playwright capture path is used, the same import schema is filled from
+browser-extracted Reddit pages before entering the manual import boundary, and
+the capture stage also leaves behind a saved log plus page snapshots so failures
+can be inspected without rerunning the browser session blindly.
 
 ### Ranking output
 

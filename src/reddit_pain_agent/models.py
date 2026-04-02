@@ -3,7 +3,27 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+def _coerce_created_utc(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
 
 
 class RateLimitSnapshot(BaseModel):
@@ -61,15 +81,95 @@ class Submission(BaseModel):
 class Comment(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    id: str
+    id: str = Field(validation_alias=AliasChoices("id", "comment_id"))
     body: str
     author: str | None = None
     score: int | None = None
-    created_utc: float | None = None
+    created_utc: float | None = Field(
+        default=None,
+        validation_alias=AliasChoices("created_utc", "created"),
+    )
     permalink: str | None = None
     parent_id: str | None = None
     link_id: str | None = None
     depth: int | None = None
+
+    @field_validator("created_utc", mode="before")
+    @classmethod
+    def parse_created_utc(cls, value: object) -> float | None:
+        return _coerce_created_utc(value)
+
+
+class ManualImportPost(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(validation_alias=AliasChoices("id", "post_id"))
+    title: str
+    subreddit: str
+    url: str = Field(validation_alias=AliasChoices("url", "permalink"))
+    permalink: str | None = None
+    score: int | None = None
+    num_comments: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("num_comments", "comments", "comments_full_count"),
+    )
+    created_utc: float | None = Field(
+        default=None,
+        validation_alias=AliasChoices("created_utc", "created"),
+    )
+    selftext: str = Field(
+        default="",
+        validation_alias=AliasChoices("selftext", "body_full", "body"),
+    )
+    author: str | None = None
+    over_18: bool | None = None
+    source_queries: list[str] = Field(default_factory=list)
+    source_subreddits: list[str] = Field(default_factory=list)
+    source_sorts: list[str] = Field(default_factory=list)
+    source_time_filters: list[str] = Field(default_factory=list)
+    retrieval_requests: list[str] = Field(default_factory=list)
+    comments: list[Comment] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("comments", "comments_full"),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_userscript_payload(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        if "id" not in normalized and normalized.get("post_id") is not None:
+            normalized["id"] = normalized.get("post_id")
+        if "url" not in normalized and normalized.get("permalink") is not None:
+            normalized["url"] = normalized.get("permalink")
+        if "num_comments" not in normalized:
+            comments_value = normalized.get("comments")
+            if isinstance(comments_value, int):
+                normalized["num_comments"] = comments_value
+            elif normalized.get("comments_full_count") is not None:
+                normalized["num_comments"] = normalized.get("comments_full_count")
+        if "selftext" not in normalized:
+            if normalized.get("body_full") is not None:
+                normalized["selftext"] = normalized.get("body_full")
+            elif normalized.get("body") is not None:
+                normalized["selftext"] = normalized.get("body")
+        if not isinstance(normalized.get("comments"), list) and isinstance(
+            normalized.get("comments_full"), list
+        ):
+            normalized["comments"] = normalized.get("comments_full")
+        return normalized
+
+    @field_validator("created_utc", mode="before")
+    @classmethod
+    def parse_created_utc(cls, value: object) -> float | None:
+        return _coerce_created_utc(value)
+
+
+class ManualImportBundle(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    posts: list[ManualImportPost] = Field(default_factory=list)
 
 
 class CandidatePost(BaseModel):
@@ -113,6 +213,8 @@ class RunManifest(BaseModel):
     started_at: datetime
     completed_at: datetime | None = None
     output_dir: str
+    retrieval_mode: Literal["api", "manual"] = "api"
+    manual_input_path: str | None = None
     subreddits: list[str]
     queries: list[str]
     query_variants: list[str] = Field(default_factory=list)
@@ -132,6 +234,7 @@ class RunManifest(BaseModel):
     max_concurrent_requests: int
     request_count: int = 0
     raw_search_artifacts: list[str] = Field(default_factory=list)
+    raw_manual_artifacts: list[str] = Field(default_factory=list)
     candidate_count: int = 0
     filtered_counts: dict[str, int] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
