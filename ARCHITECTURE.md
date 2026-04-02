@@ -117,8 +117,13 @@ Owns query expansion and candidate collection:
 
 * category-to-query expansion
 * multi-subreddit retrieval orchestration
+* paginated subreddit search retrieval
+* deterministic search-plan expansion across sorts and time windows
 * candidate normalization
-* filtering deleted / empty / low-signal entries
+* deterministic retrieval-quality gating before ranking
+* filtering deleted / empty / low-signal entries with explicit rejection counts
+* explicit comment enrichment for shortlisted submissions
+* bounded `MoreComments` expansion to reduce truncated comment evidence
 
 ### `artifact_store.py`
 
@@ -129,6 +134,7 @@ Owns persisted run artifacts:
 * request log persistence
 * raw response persistence
 * normalized artifact writes
+* top-level run report persistence
 
 ### `ranking.py`
 
@@ -137,10 +143,19 @@ Owns candidate scoring:
 * textual relevance
 * engagement weighting
 * comment richness
+* discussion-depth gating from saved comment evidence
 * modest recency
 * explainable score breakdown
 
 It must be possible to inspect why a post ranked highly.
+
+The current vertical slice uses this module to:
+
+* screen posts deterministically before ranking using saved-comment discussion depth
+* score candidate posts deterministically
+* persist `candidate_screening.json` with explicit rejection reasons
+* persist a full ranking artifact
+* persist `selected_posts.json` as the shortlist for downstream stages
 
 ### `clustering.py`
 
@@ -155,6 +170,13 @@ Owns theme grouping:
 Initial implementation should be understandable and testable.
 TF-IDF + cosine similarity + deterministic clustering is acceptable.
 
+The current vertical slice uses this module to:
+
+* cluster the ranked shortlist deterministically
+* select the strongest repeated-pain cluster
+* persist `theme_summary.json` for downstream stages
+* persist `cluster_evidence_validation.json` so synthesis can reject theme clusters with weak complaint evidence
+
 ### `pain_analysis.py`
 
 Owns evidence extraction:
@@ -167,6 +189,14 @@ Owns evidence extraction:
 * grouping-level pain synthesis inputs
 
 This stage prepares structured evidence for the memo.
+
+The current vertical slice uses this module to:
+
+* load `candidate_posts.json`
+* score and select representative saved comments deterministically
+* build a deterministic evidence prompt
+* call the configured LLM provider for summary generation
+* persist summary artifacts back into the run directory
 
 ### `llm.py`
 
@@ -201,12 +231,28 @@ Owns markdown generation:
 
 It can combine deterministic formatting with LLM-generated content.
 
+The current vertical slice uses this module to:
+
+* load `theme_summary.json` and require a strongest cluster
+* fail clearly when the strongest cluster has fewer than 5 related posts
+* build a grounded memo prompt from the strongest cluster plus saved evidence summary
+* persist `final_memo.md`, `final_memo.json`, prompt text, and raw LLM response artifacts
+
 ### `main.py`
 
 Owns CLI entry points:
 
 * `search`
 * `run`
+
+The current vertical slice exposes explicit stage commands plus an end-to-end `run`
+command that orchestrates retrieval, comment enrichment, ranking, clustering,
+summary generation, and final memo writing.
+
+It also supports resumable runs by consulting `run_report.json`, validating that
+completed-stage artifacts still exist, validating their recorded fingerprints,
+and reusing only the completed stages whose recorded parameters still match the
+current CLI invocation.
 
 ### `utils.py`
 
@@ -235,6 +281,7 @@ Candidate posts with:
 * num_comments
 * created_utc
 * selftext
+* retrieval provenance
 * selected comment text
 
 ### Ranking output

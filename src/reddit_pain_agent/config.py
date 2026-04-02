@@ -15,8 +15,13 @@ DEFAULT_MAX_CONCURRENT_REQUESTS = 4
 DEFAULT_SORT = "relevance"
 DEFAULT_TIME_FILTER = "all"
 DEFAULT_LIMIT = 25
+DEFAULT_PAGES_PER_QUERY = 2
+DEFAULT_EXPAND_QUERIES = True
 ALLOWED_SORTS = {"comments", "hot", "new", "relevance", "top"}
 ALLOWED_TIME_FILTERS = {"all", "day", "hour", "month", "week", "year"}
+DEFAULT_LLM_PROVIDER = "lmstudio"
+DEFAULT_LMSTUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
+DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS = 60.0
 
 
 class ConfigurationError(ValueError):
@@ -106,6 +111,24 @@ class RuntimeConfig:
         }
 
 
+@dataclass(frozen=True)
+class LLMConfig:
+    provider: str
+    base_url: str
+    model: str | None
+    api_key: str | None
+    request_timeout_seconds: float = DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS
+
+    def public_settings(self) -> dict[str, object]:
+        return {
+            "provider": self.provider,
+            "base_url": self.base_url,
+            "model": self.model,
+            "request_timeout_seconds": self.request_timeout_seconds,
+            "api_key_configured": bool(self.api_key),
+        }
+
+
 def _read_env(name: str, default: str | None = None) -> str | None:
     value = os.getenv(name)
     if value is None:
@@ -178,6 +201,31 @@ def load_runtime_config(output_root_override: str | Path | None = None) -> Runti
             _read_env("REDDIT_MAX_CONCURRENT_REQUESTS"),
             "REDDIT_MAX_CONCURRENT_REQUESTS",
             DEFAULT_MAX_CONCURRENT_REQUESTS,
+        ),
+    )
+
+
+def load_llm_config(require_model: bool = False) -> LLMConfig:
+    provider = (_read_env("LLM_PROVIDER", DEFAULT_LLM_PROVIDER) or DEFAULT_LLM_PROVIDER).lower()
+    if provider != "lmstudio":
+        raise ConfigurationError(
+            "Unsupported LLM_PROVIDER. Supported values: lmstudio"
+        )
+
+    model = _read_env("LLM_MODEL")
+    if require_model and model is None:
+        raise ConfigurationError("Missing required environment variable: LLM_MODEL")
+
+    base_url = _read_env("LLM_BASE_URL", DEFAULT_LMSTUDIO_BASE_URL) or DEFAULT_LMSTUDIO_BASE_URL
+    return LLMConfig(
+        provider=provider,
+        base_url=base_url.rstrip("/"),
+        model=model,
+        api_key=_read_env("LLM_API_KEY"),
+        request_timeout_seconds=_parse_positive_float(
+            _read_env("LLM_REQUEST_TIMEOUT_SECONDS"),
+            "LLM_REQUEST_TIMEOUT_SECONDS",
+            DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS,
         ),
     )
 

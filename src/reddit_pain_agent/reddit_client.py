@@ -59,7 +59,66 @@ class RedditClient:
             method="GET",
             url=f"{self._config.api_base_url}/r/{spec.subreddit}/search",
             params=params,
-            request_name=f"search:{spec.subreddit}",
+            request_name=f"search:{spec.subreddit}:{spec.query}:{spec.after or 'start'}",
+        )
+
+    async def fetch_submission_comments(
+        self,
+        permalink: str,
+        *,
+        sort: str = "best",
+        limit: int = 20,
+        depth: int = 3,
+    ) -> tuple[dict[str, Any], RequestLogEntry]:
+        normalized_permalink = permalink.strip()
+        if not normalized_permalink:
+            raise RedditClientError("submission permalink is required for comment retrieval")
+        if normalized_permalink.startswith("https://www.reddit.com"):
+            normalized_permalink = normalized_permalink.removeprefix("https://www.reddit.com")
+        if normalized_permalink.startswith("http://www.reddit.com"):
+            normalized_permalink = normalized_permalink.removeprefix("http://www.reddit.com")
+        if not normalized_permalink.startswith("/"):
+            normalized_permalink = f"/{normalized_permalink}"
+
+        return await self._request(
+            method="GET",
+            url=f"{self._config.api_base_url}{normalized_permalink}.json",
+            params={
+                "raw_json": "1",
+                "sort": sort,
+                "limit": str(limit),
+                "depth": str(depth),
+            },
+            request_name=f"comments:{normalized_permalink}",
+        )
+
+    async def fetch_more_children(
+        self,
+        *,
+        link_id: str,
+        children: list[str],
+        sort: str = "best",
+        depth: int = 3,
+        limit_children: bool = True,
+    ) -> tuple[dict[str, Any], RequestLogEntry]:
+        if not link_id.strip():
+            raise RedditClientError("link_id is required for /api/morechildren")
+        if not children:
+            raise RedditClientError("children are required for /api/morechildren")
+
+        return await self._request(
+            method="GET",
+            url=f"{self._config.api_base_url}/api/morechildren",
+            params={
+                "api_type": "json",
+                "children": ",".join(children),
+                "depth": str(depth),
+                "limit_children": "true" if limit_children else "false",
+                "link_id": link_id,
+                "sort": sort,
+                "raw_json": "1",
+            },
+            request_name=f"morechildren:{link_id}",
         )
 
     async def _request(

@@ -20,14 +20,19 @@ class SearchRequestSpec(BaseModel):
     sort: str = "relevance"
     time_filter: str = "all"
     limit: int = Field(default=25, ge=1, le=100)
+    seed_query: str | None = None
     after: str | None = None
 
     @property
     def request_key(self) -> str:
+        query_key = self.query.lower()
+        seed_query = (self.seed_query or "").lower()
+        if seed_query and seed_query != query_key:
+            query_key = f"{seed_query}=>{query_key}"
         return "|".join(
             [
                 self.subreddit.lower(),
-                self.query.lower(),
+                query_key,
                 self.sort.lower(),
                 self.time_filter.lower(),
                 self.after or "",
@@ -64,6 +69,7 @@ class Comment(BaseModel):
     permalink: str | None = None
     parent_id: str | None = None
     link_id: str | None = None
+    depth: int | None = None
 
 
 class CandidatePost(BaseModel):
@@ -79,8 +85,11 @@ class CandidatePost(BaseModel):
     created_utc: float | None = None
     selftext: str = ""
     author: str | None = None
+    over_18: bool | None = None
     source_queries: list[str] = Field(default_factory=list)
     source_subreddits: list[str] = Field(default_factory=list)
+    source_sorts: list[str] = Field(default_factory=list)
+    source_time_filters: list[str] = Field(default_factory=list)
     retrieval_requests: list[str] = Field(default_factory=list)
 
 
@@ -106,9 +115,18 @@ class RunManifest(BaseModel):
     output_dir: str
     subreddits: list[str]
     queries: list[str]
+    query_variants: list[str] = Field(default_factory=list)
+    search_sorts: list[str] = Field(default_factory=list)
+    search_time_filters: list[str] = Field(default_factory=list)
+    min_score: int = 0
+    min_comments: int = 0
+    filter_nsfw: bool = False
+    allowed_subreddits: list[str] = Field(default_factory=list)
+    denied_subreddits: list[str] = Field(default_factory=list)
     sort: str
     time_filter: str
     limit: int
+    pages_per_query: int = 1
     request_timeout_seconds: float
     max_retries: int
     max_concurrent_requests: int
@@ -117,3 +135,211 @@ class RunManifest(BaseModel):
     candidate_count: int = 0
     filtered_counts: dict[str, int] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+
+
+class LLMGenerationResult(BaseModel):
+    provider: str
+    model: str
+    prompt: str
+    output_text: str
+    raw_response: dict
+
+
+class EvidenceSummaryArtifact(BaseModel):
+    run_dir: str
+    generated_at: datetime
+    provider: str
+    model: str
+    candidate_count: int
+    comment_count: int = 0
+    selected_comment_count: int = 0
+    max_posts_used: int
+    prompt_artifact_path: str
+    raw_response_artifact_path: str
+    summary_markdown_artifact_path: str
+    summary_text: str
+
+
+class FinalMemoArtifact(BaseModel):
+    run_dir: str
+    generated_at: datetime
+    provider: str
+    model: str
+    strongest_cluster_id: str
+    strongest_cluster_size: int
+    included_post_count: int
+    prompt_artifact_path: str
+    raw_response_artifact_path: str
+    final_memo_artifact_path: str
+    memo_text: str
+
+
+class RunStageReport(BaseModel):
+    stage: str
+    status: Literal["completed", "failed", "skipped", "stopped"]
+    duration_ms: float | None = None
+    details: dict[str, object] = Field(default_factory=dict)
+    artifact_fingerprints: dict[str, str] = Field(default_factory=dict)
+
+
+class RunReportArtifact(BaseModel):
+    run_slug: str
+    run_dir: str
+    status: Literal["completed", "failed", "stopped"]
+    started_at: datetime
+    completed_at: datetime
+    subreddits: list[str]
+    queries: list[str]
+    sort: str
+    time_filter: str
+    limit: int
+    provider: str | None = None
+    model: str | None = None
+    stop_reason: str | None = None
+    error: str | None = None
+    stage_reports: list[RunStageReport] = Field(default_factory=list)
+    output_paths: dict[str, str] = Field(default_factory=dict)
+
+
+class SubmissionCommentsArtifact(BaseModel):
+    submission_id: str
+    subreddit: str
+    permalink: str | None = None
+    title: str
+    fetched_comment_count: int
+    comments: list[Comment] = Field(default_factory=list)
+
+
+class CommentEnrichmentArtifact(BaseModel):
+    run_dir: str
+    generated_at: datetime
+    requested_submission_count: int
+    fetched_submission_count: int
+    comment_count: int
+    morechildren_request_count: int = 0
+    raw_comment_artifacts: list[str] = Field(default_factory=list)
+    normalized_comment_artifacts: list[str] = Field(default_factory=list)
+
+
+class CommentSelectionBreakdown(BaseModel):
+    length_score: float = 0.0
+    engagement_score: float = 0.0
+    depth_score: float = 0.0
+    detail_score: float = 0.0
+    penalty_score: float = 0.0
+    total_score: float = 0.0
+
+
+class SelectedCommentEvidence(BaseModel):
+    submission_id: str
+    comment_id: str
+    body: str
+    score: int | None = None
+    depth: int | None = None
+    permalink: str | None = None
+    breakdown: CommentSelectionBreakdown
+
+
+class CommentSelectionArtifact(BaseModel):
+    run_dir: str
+    generated_at: datetime
+    total_saved_comments: int
+    selected_comment_count: int
+    max_comments_per_post: int
+    selections: list[SelectedCommentEvidence] = Field(default_factory=list)
+
+
+class CommentScreeningBreakdown(BaseModel):
+    saved_comment_count: int = 0
+    non_trivial_comment_count: int = 0
+    complaint_signal_comment_count: int = 0
+
+
+class CandidateScreeningDecision(BaseModel):
+    candidate: CandidatePost
+    kept: bool
+    rejection_reason: str | None = None
+    breakdown: CommentScreeningBreakdown
+
+
+class CandidateScreeningArtifact(BaseModel):
+    run_dir: str
+    generated_at: datetime
+    candidate_count: int
+    kept_count: int
+    rejected_count: int
+    min_non_trivial_comments: int = 0
+    min_complaint_signal_comments: int = 0
+    rejection_counts: dict[str, int] = Field(default_factory=dict)
+    decisions: list[CandidateScreeningDecision] = Field(default_factory=list)
+
+
+class PostScoreBreakdown(BaseModel):
+    query_relevance_score: float = 0.0
+    engagement_score: float = 0.0
+    comment_richness_score: float = 0.0
+    text_richness_score: float = 0.0
+    recency_score: float = 0.0
+    penalty_score: float = 0.0
+    total_score: float = 0.0
+
+
+class RankedCandidatePost(BaseModel):
+    candidate: CandidatePost
+    saved_comment_count: int = 0
+    breakdown: PostScoreBreakdown
+    rank: int
+
+
+class PostRankingArtifact(BaseModel):
+    run_dir: str
+    generated_at: datetime
+    candidate_count: int
+    screened_candidate_count: int = 0
+    rejected_candidate_count: int = 0
+    selected_count: int
+    rejection_counts: dict[str, int] = Field(default_factory=dict)
+    ranked_posts: list[RankedCandidatePost] = Field(default_factory=list)
+
+
+class ThemeCluster(BaseModel):
+    cluster_id: str
+    label: str
+    post_ids: list[str] = Field(default_factory=list)
+    size: int
+    average_post_score: float = 0.0
+    total_comment_count: int = 0
+    top_terms: list[str] = Field(default_factory=list)
+    member_ranks: list[int] = Field(default_factory=list)
+    cohesion_score: float = 0.0
+
+
+class ClusterEvidenceMember(BaseModel):
+    post_id: str
+    kept: bool = False
+    non_trivial_comment_count: int = 0
+    complaint_signal_comment_count: int = 0
+
+
+class ClusterEvidenceValidationArtifact(BaseModel):
+    run_dir: str
+    generated_at: datetime
+    strongest_cluster_id: str | None = None
+    strongest_cluster_post_count: int = 0
+    screening_available: bool = False
+    screened_cluster_post_count: int = 0
+    complaint_signal_post_count: int = 0
+    min_cluster_complaint_posts: int = 0
+    passes: bool = True
+    failure_reason: str | None = None
+    members: list[ClusterEvidenceMember] = Field(default_factory=list)
+
+
+class ThemeSummaryArtifact(BaseModel):
+    run_dir: str
+    generated_at: datetime
+    source_post_count: int
+    cluster_count: int
+    strongest_cluster_id: str | None = None
+    strongest_post_ids: list[str] = Field(default_factory=list)
+    clusters: list[ThemeCluster] = Field(default_factory=list)
