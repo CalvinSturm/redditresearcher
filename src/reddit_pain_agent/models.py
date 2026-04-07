@@ -277,6 +277,39 @@ class FinalMemoArtifact(BaseModel):
     memo_text: str
 
 
+class ReplyDraft(BaseModel):
+    post_id: str
+    title: str
+    subreddit: str
+    url: str
+    rank: int | None = None
+    reply_text: str
+    relevance_score: float | None = None
+    conversation_value_score: float | None = None
+    voice_match_score: float | None = None
+    reddit_friendliness_score: float | None = None
+    average_score: float | None = None
+    passed_threshold: bool | None = None
+    evaluation_feedback: str | None = None
+
+
+class ReplyDraftArtifact(BaseModel):
+    run_dir: str
+    generated_at: datetime
+    provider: str
+    model: str
+    selected_post_count: int
+    voice: str
+    improvement_rounds: int = 0
+    score_threshold: float = 4.0
+    minimum_dimension_score: float = 3.0
+    passed_threshold: bool = False
+    prompt_artifact_path: str
+    raw_response_artifact_path: str
+    reply_markdown_artifact_path: str
+    drafts: list[ReplyDraft] = Field(default_factory=list)
+
+
 class RunStageReport(BaseModel):
     stage: str
     status: Literal["completed", "failed", "skipped", "stopped"]

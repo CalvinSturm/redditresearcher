@@ -31,6 +31,8 @@ class ArtifactStore:
         self.evidence_summary_markdown_path = run_dir / "evidence_summary.md"
         self.final_memo_json_path = run_dir / "final_memo.json"
         self.final_memo_markdown_path = run_dir / "final_memo.md"
+        self.reply_drafts_json_path = run_dir / "reply_drafts.json"
+        self.reply_drafts_markdown_path = run_dir / "reply_drafts.md"
         self.run_report_json_path = run_dir / "run_report.json"
         self.raw_search_dir.mkdir(parents=True, exist_ok=True)
         self.raw_manual_dir.mkdir(parents=True, exist_ok=True)
@@ -124,6 +126,12 @@ class ArtifactStore:
 
     def write_final_memo_markdown(self, content: str) -> None:
         _atomic_write_text(self.final_memo_markdown_path, content)
+
+    def write_reply_drafts_json(self, payload: dict[str, Any]) -> None:
+        _atomic_write_json(self.reply_drafts_json_path, payload)
+
+    def write_reply_drafts_markdown(self, content: str) -> None:
+        _atomic_write_text(self.reply_drafts_markdown_path, content)
 
     def write_run_report_json(self, payload: dict[str, Any]) -> None:
         _atomic_write_json(self.run_report_json_path, payload)

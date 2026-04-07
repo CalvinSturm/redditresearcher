@@ -28,6 +28,7 @@ from .memo_writer import write_final_memo
 from .models import RunReportArtifact, RunStageReport
 from .pain_analysis import summarize_candidate_posts
 from .playwright_capture import capture_reddit_threads
+from .reply_writer import draft_reply_suggestions
 from .ranking import rank_run_candidates
 from .retrieval import (
     enrich_run_with_comments,
@@ -103,6 +104,8 @@ def _build_run_output_paths(run_dir: Path) -> dict[str, str]:
         "evidence_summary": str(run_dir / "evidence_summary.json"),
         "final_memo": str(run_dir / "final_memo.md"),
         "final_memo_json": str(run_dir / "final_memo.json"),
+        "reply_drafts": str(run_dir / "reply_drafts.md"),
+        "reply_drafts_json": str(run_dir / "reply_drafts.json"),
         "run_report": str(run_dir / "run_report.json"),
     }
 
@@ -1030,6 +1033,50 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=8,
         help="Maximum number of strongest-cluster posts to include in the memo prompt",
+    )
+
+    reply_parser = subparsers.add_parser(
+        "reply-drafts",
+        help="Draft Reddit-friendly reply suggestions for manual review from the top saved run posts",
+    )
+    reply_parser.add_argument(
+        "--run-dir",
+        type=Path,
+        required=True,
+        help="Path to a run directory containing selected_posts.json or candidate_posts.json",
+    )
+    reply_parser.add_argument(
+        "--voice",
+        required=True,
+        help="Short description of the user's writing voice to use for the reply drafts",
+    )
+    reply_parser.add_argument(
+        "--model",
+        help="Optional model override for reply draft generation",
+    )
+    reply_parser.add_argument(
+        "--max-posts",
+        type=int,
+        default=3,
+        help="Maximum number of posts to draft replies for",
+    )
+    reply_parser.add_argument(
+        "--score-threshold",
+        type=float,
+        default=4.0,
+        help="Average evaluation score required for a reply draft to pass the improvement loop",
+    )
+    reply_parser.add_argument(
+        "--minimum-dimension-score",
+        type=float,
+        default=3.0,
+        help="Minimum per-dimension evaluation score required for a reply draft to pass",
+    )
+    reply_parser.add_argument(
+        "--max-improvement-rounds",
+        type=int,
+        default=3,
+        help="Maximum number of revision rounds after the initial draft",
     )
 
     llm_parser = subparsers.add_parser("llm", help="Interact with the configured LLM provider")
@@ -2217,6 +2264,47 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         except Exception as exc:
             print(f"Memo generation failed: {exc}", file=sys.stderr)
+            return 1
+
+    if args.command == "reply-drafts":
+        try:
+            if args.max_posts <= 0:
+                raise ValueError("--max-posts must be greater than 0")
+            if not args.voice.strip():
+                raise ValueError("--voice is required")
+            config = load_llm_config(require_model=not args.model)
+
+            async def _run_reply_drafts() -> int:
+                async with LMStudioClient(config) as client:
+                    artifact = await draft_reply_suggestions(
+                        run_dir=args.run_dir,
+                        client=client,
+                        voice=args.voice,
+                        model=args.model,
+                        max_posts=args.max_posts,
+                        score_threshold=args.score_threshold,
+                        minimum_dimension_score=args.minimum_dimension_score,
+                        max_improvement_rounds=args.max_improvement_rounds,
+                    )
+                print(f"run_dir: {artifact.run_dir}")
+                print(f"provider: {artifact.provider}")
+                print(f"model: {artifact.model}")
+                print(f"selected_posts: {artifact.selected_post_count}")
+                print(f"improvement_rounds: {artifact.improvement_rounds}")
+                print(f"passed_threshold: {'yes' if artifact.passed_threshold else 'no'}")
+                print(f"score_threshold: {artifact.score_threshold}")
+                print(f"minimum_dimension_score: {artifact.minimum_dimension_score}")
+                print("manual_review_only: yes")
+                print(f"reply_drafts_json: {args.run_dir / 'reply_drafts.json'}")
+                print(f"reply_drafts_markdown: {args.run_dir / 'reply_drafts.md'}")
+                return 0
+
+            return asyncio.run(_run_reply_drafts())
+        except (ConfigurationError, ValueError, FileNotFoundError) as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:
+            print(f"Reply draft generation failed: {exc}", file=sys.stderr)
             return 1
 
     parser.error(f"unknown command: {args.command}")

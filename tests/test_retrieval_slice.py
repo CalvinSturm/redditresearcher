@@ -36,6 +36,7 @@ from reddit_pain_agent.models import (
     Comment,
     ManualImportPost,
     RankedCandidatePost,
+    ReplyDraft,
     RunManifest,
     SearchRequestSpec,
     SubmissionCommentsArtifact,
@@ -56,7 +57,16 @@ from reddit_pain_agent.playwright_capture import (
     merge_captured_posts,
     select_search_results,
 )
-from reddit_pain_agent.prompts import build_candidate_evidence_prompt, build_final_memo_prompt
+from reddit_pain_agent.prompts import (
+    build_candidate_evidence_prompt,
+    build_final_memo_prompt,
+    build_reply_drafts_prompt,
+)
+from reddit_pain_agent.reply_writer import (
+    build_reply_drafts_markdown,
+    draft_reply_suggestions,
+    load_reply_source_posts,
+)
 from reddit_pain_agent.ranking import (
     analyze_comment_screening,
     has_complaint_signal,
@@ -274,6 +284,15 @@ class ArtifactStoreTests(unittest.TestCase):
             store.write_run_report_json({"status": "completed"})
 
             self.assertTrue(store.run_report_json_path.exists())
+
+    def test_artifact_store_writes_reply_draft_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = build_artifact_store(Path(tmpdir), "run-8")
+            store.write_reply_drafts_json({"selected_post_count": 2})
+            store.write_reply_drafts_markdown("# Reply Drafts\n")
+
+            self.assertTrue(store.reply_drafts_json_path.exists())
+            self.assertTrue(store.reply_drafts_markdown_path.exists())
 
 
 class RetrievalNormalizationTests(unittest.TestCase):
@@ -1306,6 +1325,30 @@ class PromptAndSummaryTests(unittest.TestCase):
         self.assertIn("cluster_id: cluster-1", prompt)
         self.assertIn("Manual follow-up keeps showing up.", prompt)
 
+    def test_build_reply_drafts_prompt_includes_voice_and_post_ids(self) -> None:
+        prompt = build_reply_drafts_prompt(
+            [
+                RankedCandidatePost(
+                    candidate=CandidatePost(
+                        id="abc123",
+                        title="Manual follow-up is eating my week",
+                        subreddit="Entrepreneur",
+                        url="https://reddit.com/example",
+                        selftext="Still doing this in spreadsheets.",
+                    ),
+                    saved_comment_count=0,
+                    breakdown={"total_score": 7.0},
+                    rank=1,
+                )
+            ],
+            voice="calm, practical, first-person founder voice",
+            max_posts=1,
+        )
+        self.assertIn("User voice: calm, practical, first-person founder voice", prompt)
+        self.assertIn("post_id: abc123", prompt)
+        self.assertIn("1 to 3 short paragraphs", prompt)
+        self.assertIn("Reddit-friendly", prompt)
+
     def test_load_candidate_posts_reads_candidate_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             run_dir = Path(tmpdir)
@@ -1355,6 +1398,25 @@ class PromptAndSummaryTests(unittest.TestCase):
         self.assertIn("strongest_cluster_id: cluster-1", markdown)
         self.assertIn("posts_used: 5", markdown)
         self.assertIn("The theme is real.", markdown)
+
+    def test_build_reply_drafts_markdown_renders_manual_review_metadata(self) -> None:
+        markdown = build_reply_drafts_markdown(
+            [
+                ReplyDraft(
+                    post_id="abc123",
+                    title="Manual follow-up is eating my week",
+                    subreddit="Entrepreneur",
+                    url="https://reddit.com/example",
+                    rank=1,
+                    reply_text="I can relate to this because the manual handoff is where things usually break.",
+                )
+            ],
+            provider="lmstudio",
+            model="openai/gpt-oss-20b",
+            voice="plainspoken founder",
+        )
+        self.assertIn("- manual_review_only: yes", markdown)
+        self.assertIn("I can relate to this because the manual handoff is where things usually break.", markdown)
 
     def test_load_submission_comments_reads_comment_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1430,6 +1492,22 @@ class PromptAndSummaryTests(unittest.TestCase):
 
         self.assertEqual(posts[0].id, "sel1")
 
+    def test_load_reply_source_posts_prefers_selected_posts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir)
+            (run_dir / "selected_posts.json").write_text(
+                (
+                    '[{"candidate":{"id":"abc123","title":"Manual follow-up is eating my week",'
+                    '"subreddit":"Entrepreneur","url":"https://reddit.com/example"},'
+                    '"saved_comment_count":0,"breakdown":{"total_score":7.0},"rank":1}]'
+                ),
+                encoding="utf-8",
+            )
+            posts = load_reply_source_posts(run_dir)
+
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0].candidate.id, "abc123")
+
     def test_load_summary_posts_prefers_strongest_cluster_over_selected_posts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             run_dir = Path(tmpdir)
@@ -1502,6 +1580,245 @@ class PromptAndSummaryTests(unittest.TestCase):
             max_comments_per_post=2,
         )
         self.assertEqual([item.comment_id for item in selected["abc123"]], ["c2", "c3"])
+
+    def test_draft_reply_suggestions_writes_reply_artifacts(self) -> None:
+        class FakeLMStudioClient:
+            async def generate_response(self, prompt, model=None):
+                if "Evaluate the reply drafts below" in prompt:
+                    payload = {
+                        "provider": "lmstudio",
+                        "model": model or "openai/gpt-oss-20b",
+                        "output_text": json.dumps(
+                            {
+                                "evaluations": [
+                                    {
+                                        "post_id": "abc123",
+                                        "relevance_score": 4,
+                                        "conversation_value_score": 4,
+                                        "voice_match_score": 4,
+                                        "reddit_friendliness_score": 5,
+                                        "feedback": "Make the take slightly sharper.",
+                                    }
+                                ]
+                            }
+                        ),
+                        "raw_response": {"id": "resp_eval_1"},
+                    }
+                elif "Revise the reply drafts below" in prompt:
+                    payload = {
+                        "provider": "lmstudio",
+                        "model": model or "openai/gpt-oss-20b",
+                        "output_text": (
+                            "## Post 1\n"
+                            "post_id: abc123\n"
+                            "reply: I can see why this is frustrating. The spreadsheet fallback usually means the process never became trustworthy in the first place.\n\n"
+                            "What stands out to me is that people usually do not need more steps here, they need a workflow they will actually trust when things get busy.\n"
+                        ),
+                        "raw_response": {"id": "resp_reply_2"},
+                    }
+                else:
+                    payload = {
+                        "provider": "lmstudio",
+                        "model": model or "openai/gpt-oss-20b",
+                        "output_text": (
+                            "## Post 1\n"
+                            "post_id: abc123\n"
+                            "reply: I can see why this is frustrating.\n"
+                        ),
+                        "raw_response": {"id": "resp_reply_1"},
+                    }
+                return type("Generation", (), payload)()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir)
+            (run_dir / "selected_posts.json").write_text(
+                (
+                    '[{"candidate":{"id":"abc123","title":"Manual follow-up is eating my week",'
+                    '"subreddit":"Entrepreneur","url":"https://reddit.com/example","selftext":"Still using spreadsheets."},'
+                    '"saved_comment_count":0,"breakdown":{"total_score":7.0},"rank":1}]'
+                ),
+                encoding="utf-8",
+            )
+            artifact = asyncio.run(
+                draft_reply_suggestions(
+                    run_dir,
+                    FakeLMStudioClient(),
+                    voice="plainspoken founder",
+                    max_posts=1,
+                )
+            )
+
+            self.assertEqual(artifact.selected_post_count, 1)
+            self.assertEqual(artifact.improvement_rounds, 0)
+            self.assertTrue(artifact.passed_threshold)
+            self.assertTrue((run_dir / "reply_drafts.json").exists())
+            self.assertTrue((run_dir / "reply_drafts.md").exists())
+            self.assertTrue((run_dir / "prompts" / "reply-drafts.txt").exists())
+            self.assertTrue((run_dir / "raw" / "llm" / "reply-drafts.json").exists())
+            self.assertTrue((run_dir / "prompts" / "reply-drafts-initial.txt").exists())
+            self.assertTrue((run_dir / "raw" / "llm" / "reply-drafts-initial.json").exists())
+            self.assertTrue((run_dir / "prompts" / "reply-drafts-evaluation-round-00.txt").exists())
+            self.assertTrue((run_dir / "raw" / "llm" / "reply-drafts-evaluation-round-00.json").exists())
+
+    def test_draft_reply_suggestions_normalizes_reply_to_three_plain_paragraphs_max(self) -> None:
+        class FakeLMStudioClient:
+            async def generate_response(self, prompt, model=None):
+                if "Evaluate the reply drafts below" in prompt:
+                    payload = {
+                        "provider": "lmstudio",
+                        "model": model or "openai/gpt-oss-20b",
+                        "output_text": json.dumps(
+                            {
+                                "evaluations": [
+                                    {
+                                        "post_id": "abc123",
+                                        "relevance_score": 4,
+                                        "conversation_value_score": 4,
+                                        "voice_match_score": 4,
+                                        "reddit_friendliness_score": 4,
+                                        "feedback": "Looks good.",
+                                    }
+                                ]
+                            }
+                        ),
+                        "raw_response": {"id": "resp_eval_norm"},
+                    }
+                else:
+                    payload = {
+                        "provider": "lmstudio",
+                        "model": model or "openai/gpt-oss-20b",
+                        "output_text": (
+                            "## Post 1\n"
+                            "post_id: abc123\n"
+                            "reply: # Heading\n"
+                            "- first point\n\n"
+                            "Second paragraph.\n\n"
+                            "Third paragraph.\n\n"
+                            "Fourth paragraph.\n"
+                        ),
+                        "raw_response": {"id": "resp_reply_norm"},
+                    }
+                return type("Generation", (), payload)()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir)
+            (run_dir / "selected_posts.json").write_text(
+                (
+                    '[{"candidate":{"id":"abc123","title":"Manual follow-up is eating my week",'
+                    '"subreddit":"Entrepreneur","url":"https://reddit.com/example","selftext":"Still using spreadsheets."},'
+                    '"saved_comment_count":0,"breakdown":{"total_score":7.0},"rank":1}]'
+                ),
+                encoding="utf-8",
+            )
+            artifact = asyncio.run(
+                draft_reply_suggestions(
+                    run_dir,
+                    FakeLMStudioClient(),
+                    voice="plainspoken founder",
+                    max_posts=1,
+                )
+            )
+
+        self.assertNotIn("# Heading", artifact.drafts[0].reply_text)
+        self.assertNotIn("- first point", artifact.drafts[0].reply_text)
+        self.assertEqual(len([p for p in artifact.drafts[0].reply_text.split("\n\n") if p.strip()]), 3)
+
+    def test_draft_reply_suggestions_revises_until_threshold_or_limit(self) -> None:
+        class FakeLMStudioClient:
+            def __init__(self) -> None:
+                self.revision_count = 0
+
+            async def generate_response(self, prompt, model=None):
+                if "Evaluate the reply drafts below" in prompt and self.revision_count == 0:
+                    payload = {
+                        "provider": "lmstudio",
+                        "model": model or "openai/gpt-oss-20b",
+                        "output_text": json.dumps(
+                            {
+                                "evaluations": [
+                                    {
+                                        "post_id": "abc123",
+                                        "relevance_score": 2,
+                                        "conversation_value_score": 2,
+                                        "voice_match_score": 3,
+                                        "reddit_friendliness_score": 4,
+                                        "feedback": "Be more specific to the post and add a clearer take.",
+                                    }
+                                ]
+                            }
+                        ),
+                        "raw_response": {"id": "resp_eval_fail"},
+                    }
+                elif "Revise the reply drafts below" in prompt:
+                    self.revision_count += 1
+                    payload = {
+                        "provider": "lmstudio",
+                        "model": model or "openai/gpt-oss-20b",
+                        "output_text": (
+                            "## Post 1\n"
+                            "post_id: abc123\n"
+                            "reply: I think the trust issue is the real problem here, not just the spreadsheet itself.\n\n"
+                            "Once people start keeping backup habits around a workflow, the tool is already losing because nobody trusts it when the day gets messy.\n"
+                        ),
+                        "raw_response": {"id": "resp_revision_pass"},
+                    }
+                elif "Evaluate the reply drafts below" in prompt and self.revision_count == 1:
+                    payload = {
+                        "provider": "lmstudio",
+                        "model": model or "openai/gpt-oss-20b",
+                        "output_text": json.dumps(
+                            {
+                                "evaluations": [
+                                    {
+                                        "post_id": "abc123",
+                                        "relevance_score": 4,
+                                        "conversation_value_score": 4,
+                                        "voice_match_score": 4,
+                                        "reddit_friendliness_score": 4,
+                                        "feedback": "Good.",
+                                    }
+                                ]
+                            }
+                        ),
+                        "raw_response": {"id": "resp_eval_pass"},
+                    }
+                else:
+                    payload = {
+                        "provider": "lmstudio",
+                        "model": model or "openai/gpt-oss-20b",
+                        "output_text": (
+                            "## Post 1\n"
+                            "post_id: abc123\n"
+                            "reply: I can see why this is frustrating.\n"
+                        ),
+                        "raw_response": {"id": "resp_initial"},
+                    }
+                return type("Generation", (), payload)()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir)
+            (run_dir / "selected_posts.json").write_text(
+                (
+                    '[{"candidate":{"id":"abc123","title":"Manual follow-up is eating my week",'
+                    '"subreddit":"Entrepreneur","url":"https://reddit.com/example","selftext":"Still using spreadsheets."},'
+                    '"saved_comment_count":0,"breakdown":{"total_score":7.0},"rank":1}]'
+                ),
+                encoding="utf-8",
+            )
+            artifact = asyncio.run(
+                draft_reply_suggestions(
+                    run_dir,
+                    FakeLMStudioClient(),
+                    voice="plainspoken founder",
+                    max_posts=1,
+                    max_improvement_rounds=2,
+                )
+            )
+            self.assertTrue((run_dir / "prompts" / "reply-drafts-revision-round-01.txt").exists())
+
+        self.assertEqual(artifact.improvement_rounds, 1)
+        self.assertTrue(artifact.passed_threshold)
+        self.assertEqual(artifact.drafts[0].passed_threshold, True)
 
 
 class RankingTests(unittest.TestCase):
@@ -3920,6 +4237,110 @@ class CliTests(unittest.TestCase):
         self.assertIn("strongest_cluster_id: cluster-1", output)
         self.assertIn("strongest_cluster_size: 5", output)
         self.assertIn("final_memo_markdown:", output)
+
+    def test_reply_drafts_cli_writes_reply_artifacts(self) -> None:
+        class FakeLMStudioClient:
+            def __init__(self, config):
+                self.config = config
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+            async def generate_response(self, prompt, model=None):
+                if "Evaluate the reply drafts below" in prompt:
+                    payload = {
+                        "provider": "lmstudio",
+                        "model": model or self.config.model,
+                        "prompt": prompt,
+                        "output_text": json.dumps(
+                            {
+                                "evaluations": [
+                                    {
+                                        "post_id": "abc123",
+                                        "relevance_score": 4,
+                                        "conversation_value_score": 4,
+                                        "voice_match_score": 4,
+                                        "reddit_friendliness_score": 4,
+                                        "feedback": "Good.",
+                                    }
+                                ]
+                            }
+                        ),
+                        "raw_response": {"id": "resp_eval_cli"},
+                    }
+                elif "Revise the reply drafts below" in prompt:
+                    payload = {
+                        "provider": "lmstudio",
+                        "model": model or self.config.model,
+                        "prompt": prompt,
+                        "output_text": (
+                            "## Post 1\n"
+                            "post_id: abc123\n"
+                            "reply: I can see why this is frustrating. When a process keeps collapsing back into manual follow-up, it usually means the system is still too brittle for day-to-day use.\n\n"
+                            "The part I would focus on is the trust gap, because once people start keeping backup habits around the workflow the system is already losing.\n"
+                        ),
+                        "raw_response": {"id": "resp_reply_cli_2"},
+                    }
+                else:
+                    payload = {
+                        "provider": "lmstudio",
+                        "model": model or self.config.model,
+                        "prompt": prompt,
+                        "output_text": (
+                            "## Post 1\n"
+                            "post_id: abc123\n"
+                            "reply: I can see why this is frustrating.\n"
+                        ),
+                        "raw_response": {"id": "resp_reply_cli_1"},
+                    }
+                return type("Generation", (), payload)()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir) / "run-1"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "selected_posts.json").write_text(
+                (
+                    '[{"candidate":{"id":"abc123","title":"Manual client follow-up is eating my week",'
+                    '"subreddit":"Entrepreneur","url":"https://reddit.com/example","selftext":"Still tracking leads in spreadsheets."},'
+                    '"saved_comment_count":0,"breakdown":{"total_score":7.0},"rank":1}]'
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ",
+                {
+                    "LLM_PROVIDER": "lmstudio",
+                    "LLM_BASE_URL": "http://127.0.0.1:1234/v1",
+                    "LLM_MODEL": "openai/gpt-oss-20b",
+                },
+                clear=True,
+            ):
+                with patch("reddit_pain_agent.main.LMStudioClient", FakeLMStudioClient):
+                    with patch("sys.stdout.write") as stdout_write:
+                        exit_code = main(
+                            [
+                                "reply-drafts",
+                                "--run-dir",
+                                str(run_dir),
+                                "--voice",
+                                "plainspoken founder",
+                                "--max-posts",
+                                "1",
+                            ]
+                        )
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((run_dir / "reply_drafts.json").exists())
+            self.assertTrue((run_dir / "reply_drafts.md").exists())
+
+        output = "".join(call.args[0] for call in stdout_write.call_args_list)
+        self.assertIn("manual_review_only: yes", output)
+        self.assertIn("reply_drafts_json:", output)
+        self.assertIn("selected_posts: 1", output)
+        self.assertIn("passed_threshold: yes", output)
 
     def test_comment_enrichment_expands_morechildren_bounded(self) -> None:
         class FakeRedditClient:

@@ -256,6 +256,18 @@ The current vertical slice uses this module to:
 * build a grounded memo prompt from the strongest cluster plus saved evidence summary
 * persist `final_memo.md`, `final_memo.json`, prompt text, and raw LLM response artifacts
 
+### `reply_writer.py`
+
+Owns manual-review reply drafting:
+
+* load the top saved posts from the run artifacts
+* build a grounded prompt for Reddit-friendly paragraph replies
+* apply a user-provided voice description
+* persist `reply_drafts.md`, `reply_drafts.json`, prompt text, and raw LLM response artifacts
+
+This module is for draft generation only.
+It should not post to Reddit automatically.
+
 ### `main.py`
 
 Owns CLI entry points:
@@ -266,6 +278,10 @@ Owns CLI entry points:
 The current vertical slice exposes explicit stage commands plus an end-to-end `run`
 command that orchestrates retrieval, comment enrichment, ranking, clustering,
 summary generation, and final memo writing.
+
+It also exposes a `reply-drafts` command that generates manual-review Reddit
+reply suggestions for the top saved posts in a run, using a user-provided voice
+description but not automating posting.
 
 It also exposes a `manual-import` command plus `run --manual-input <path>` so a
 research loop can continue from manually collected or Playwright-collected JSON

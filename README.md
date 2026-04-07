@@ -511,3 +511,27 @@ Current limitations:
 
 - memo generation fails if the strongest cluster has fewer than 5 related posts
 - memo synthesis is LLM-backed, but cluster selection and post selection remain deterministic
+
+## Reply draft generation
+
+After a run has produced `selected_posts.json` or `theme_summary.json`, you can draft Reddit-friendly reply suggestions for manual review.
+
+```bash
+python -m reddit_pain_agent.main reply-drafts \
+  --run-dir outputs/runs/<run-slug> \
+  --voice "plainspoken founder who is practical, empathetic, and concise" \
+  --max-posts 3
+```
+
+This writes:
+
+- `reply_drafts.json`
+- `reply_drafts.md`
+- `prompts/reply-drafts.txt`
+- `raw/llm/reply-drafts.json`
+
+Behavior:
+
+- drafts are generated for the top `n` saved posts, preferring `selected_posts.json`
+- replies are intended for manual review only; the repo does not post to Reddit automatically
+- prompts explicitly ask for natural paragraph-form replies without CTAs or spammy language
