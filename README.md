@@ -358,21 +358,28 @@ Current limitations:
 - capture logs and snapshots are written locally for debugging, but they can contain page text and should be treated as inspectable run data
 - stored post text should be treated as inspectable run data, not permanent archival data
 
-## LM Studio provider
+## LLM providers
 
-The repo now includes a minimal LLM provider layer for `lmstudio`.
+The repo now includes a minimal LLM provider layer for `lmstudio` and `openai`.
 
-This support targets LM Studio's OpenAI-compatible local server endpoints:
+LM Studio support targets its OpenAI-compatible local server endpoints:
 
 - `GET /v1/models`
 - `POST /v1/responses`
 
-Recommended environment variables:
+Recommended environment variables for LM Studio:
 
 - `LLM_PROVIDER=lmstudio`
 - `LLM_BASE_URL=http://127.0.0.1:1234/v1`
 - `LLM_MODEL=<loaded-model-id>`
 - `LLM_API_KEY=<optional if you enabled auth>`
+
+Recommended environment variables for OpenAI:
+
+- `LLM_PROVIDER=openai`
+- `LLM_BASE_URL=https://api.openai.com/v1`
+- `LLM_MODEL=<openai-model-id>`
+- `OPENAI_API_KEY=<required>` or `LLM_API_KEY=<required>`
 
 List available models:
 
@@ -389,7 +396,7 @@ python -m reddit_pain_agent.main llm prompt \
 
 Current scope:
 
-- provider support is limited to `lmstudio`
+- provider support is limited to `lmstudio` and `openai`
 - LLM usage is wired into `run`, `summarize`, and `memo`
 - retrieval, ranking, and clustering remain deterministic code paths
 
@@ -431,7 +438,7 @@ Important behavior:
 - the run stops cleanly if the strongest cluster has fewer than `--min-cluster-posts` related posts
 - the run also stops cleanly if the strongest cluster has too few complaint-signal posts for `--min-cluster-complaint-posts`
 - when that happens, the deterministic artifacts are still written, but no memo is fabricated
-- `run` uses the configured LM Studio provider only after the cluster passes that threshold
+- `run` uses the configured LLM provider only after the cluster passes that threshold
 - `run` always writes `run_report.json` once a run directory exists, including per-stage status, timings, stop reason, and key artifact paths
 - `run --manual-input ...` skips Reddit credential loading and reuses imported comment artifacts instead of calling the Reddit API
 

@@ -6,3 +6,13 @@ __pycache__/
 
 outputs/runs/*
 !outputs/runs/.gitkeep
+
+outputs/captures/*
+!outputs/captures/.gitkeep
+
+research/manual/*
+!research/manual/.gitkeep
+
+research/briefs/*
+!research/briefs/TEMPLATE.md
+!research/briefs/first-run.md

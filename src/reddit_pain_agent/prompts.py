@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from .models import CandidatePost, Comment, RankedCandidatePost, ThemeCluster
+from .models import CandidatePost, Comment, RankedCandidatePost, RunManifest, ThemeCluster
 
 
 def build_candidate_evidence_prompt(
     posts: list[CandidatePost],
     comments_by_submission: dict[str, list[Comment]] | None = None,
+    research_context: RunManifest | None = None,
     max_posts: int = 10,
     max_selftext_chars: int = 600,
     max_comments_per_post: int = 5,
@@ -43,25 +44,38 @@ def build_candidate_evidence_prompt(
 
     instructions = "\n".join(
         [
-            "You are analyzing Reddit candidate posts for repeated pain signals.",
+            f"Research Reddit for repeated pain points around this topic: {_topic_label(research_context)}.",
+            "Your job is to identify real, repeated frustrations, bottlenecks, failed workflows, workarounds, and unmet needs from Reddit discussions.",
+            "Operate like a researcher, not a content writer. Prioritize evidence density, repetition, and specificity.",
             "Work only from the evidence provided below.",
-            "Do not invent complaints, user types, workarounds, or certainty.",
-            "If the evidence is weak or mixed, say so clearly.",
-            "Return markdown with these sections and exact headings:",
-            "## Repeated Complaints",
-            "## Who Feels The Pain",
-            "## Current Workarounds",
+            "Do not fabricate Reddit data, quotes, themes, users, or conclusions.",
+            "Prefer repeated pains over one-off opinions.",
+            "Do not force a conclusion if evidence is weak or fragmented.",
+            "Separate true pain points from general preferences, ideology, or low-stakes complaints.",
+            "Do not overcount duplicates, reposts, or multiple comments from the same discussion as separate evidence.",
+            "If the evidence is mixed, say so explicitly.",
+            "Return markdown with these exact headings:",
+            "## Topic Overview",
+            "## Candidate Pain Themes",
             "## Evidence Strength",
             "## Open Questions",
         ]
     )
-    return f"{instructions}\n\n# Candidate Post Evidence\n\n" + "\n\n".join(evidence_blocks)
+    return "\n\n".join(
+        [
+            instructions,
+            _format_research_context(research_context),
+            "# Candidate Post Evidence",
+            "\n\n".join(evidence_blocks),
+        ]
+    )
 
 
 def build_final_memo_prompt(
     theme_cluster: ThemeCluster,
     posts: list[CandidatePost],
     evidence_summary_text: str,
+    research_context: RunManifest | None = None,
     *,
     max_posts: int = 8,
     max_selftext_chars: int = 450,
@@ -94,19 +108,25 @@ def build_final_memo_prompt(
 
     instructions = "\n".join(
         [
-            "You are writing a founder-grade Reddit research memo.",
+            f"Research Reddit for repeated pain points around this topic: {_topic_label(research_context)}.",
+            "Your job is to identify real, repeated frustrations, bottlenecks, failed workflows, workarounds, and unmet needs from Reddit discussions, then turn them into a grounded research memo.",
+            "Operate like a researcher, not a content writer. Prioritize evidence density, repetition, and specificity.",
             "Work only from the evidence summary and source posts below.",
-            "Do not invent post counts, user types, pain points, quotes, or workarounds.",
-            "If the evidence is mixed or weak, say so explicitly.",
+            "Do not fabricate Reddit data, quotes, themes, users, or conclusions.",
+            "Prefer repeated pains over one-off opinions.",
+            "Do not force a conclusion if evidence is weak or fragmented.",
+            "Separate true pain points from general preferences, ideology, or low-stakes complaints.",
+            "A valid pain theme must be supported by at least 5 distinct, meaningfully related posts or threads.",
+            "Do not overcount duplicates, reposts, or multiple comments from the same discussion as separate evidence.",
+            "If the evidence is mixed, say so explicitly.",
+            "For each theme, capture: theme name, why it matters, who feels it most, supporting evidence count, representative evidence, common workarounds or failed solutions, why current solutions seem insufficient, and confidence level.",
             "Use markdown with these exact headings:",
-            "# Executive Summary",
-            "## Research Takeaways",
-            "## Top 5 Product Ideas",
-            "## Best Single Bet",
-            "## 10 Content Hooks",
-            "## Risks / Caveats",
-            "Under 'Top 5 Product Ideas', provide exactly 5 numbered items.",
-            "Under '10 Content Hooks', provide exactly 10 numbered items.",
+            "## Topic Overview",
+            "## Top Repeated Pain Themes",
+            "## Product Opportunities",
+            "## Best Single Opportunity",
+            "## Risks and Caveats",
+            "Under '## Product Opportunities', provide flat bullets. Each bullet must state which theme it maps to and why it might work.",
         ]
     )
 
@@ -125,11 +145,41 @@ def build_final_memo_prompt(
     return "\n\n".join(
         [
             instructions,
+            _format_research_context(research_context),
             cluster_block,
             "# Evidence Summary",
             evidence_summary_text.strip(),
             "# Source Posts",
             "\n\n".join(post_blocks),
+        ]
+    )
+
+
+def _topic_label(research_context: RunManifest | None) -> str:
+    if research_context and research_context.topic:
+        return research_context.topic
+    if research_context and research_context.queries:
+        return research_context.queries[0]
+    return "the requested topic"
+
+
+def _format_research_context(research_context: RunManifest | None) -> str:
+    if research_context is None:
+        return "# Research Context\n- topic: unknown"
+
+    subreddits = ", ".join(research_context.subreddits) if research_context.subreddits else "unknown"
+    preferred = ", ".join(research_context.subreddits) if research_context.subreddits else "unknown"
+    avoided = ", ".join(research_context.denied_subreddits) if research_context.denied_subreddits else "none"
+    return "\n".join(
+        [
+            "# Research Context",
+            f"- topic: {research_context.topic or _topic_label(research_context)}",
+            f"- target_audience: {research_context.target_audience or 'unspecified'}",
+            f"- category: {research_context.category or 'unspecified'}",
+            f"- time_horizon: {research_context.time_horizon or research_context.time_filter or 'unspecified'}",
+            f"- subreddits_reviewed: {subreddits}",
+            f"- preferred_subreddits: {preferred}",
+            f"- avoided_subreddits: {avoided}",
         ]
     )
 

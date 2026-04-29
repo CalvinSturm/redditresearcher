@@ -23,7 +23,7 @@ from reddit_pain_agent.clustering import (
     validate_cluster_evidence,
 )
 from reddit_pain_agent.config import ConfigurationError, LLMConfig, load_llm_config, load_runtime_config
-from reddit_pain_agent.llm import LLMClientError, LMStudioClient, extract_response_text
+from reddit_pain_agent.llm import LLMClientError, LMStudioClient, build_llm_client, extract_response_text
 from reddit_pain_agent.main import main
 from reddit_pain_agent.memo_writer import (
     build_final_memo_markdown,
@@ -32,6 +32,7 @@ from reddit_pain_agent.memo_writer import (
     write_final_memo,
 )
 from reddit_pain_agent.models import (
+    AssetGenerationProvenance,
     CandidatePost,
     Comment,
     ManualImportPost,
@@ -55,6 +56,7 @@ from reddit_pain_agent.playwright_capture import (
     build_reddit_search_urls,
     capture_reddit_threads,
     merge_captured_posts,
+    repair_capture_timestamps,
     select_search_results,
 )
 from reddit_pain_agent.prompts import (
@@ -66,6 +68,7 @@ from reddit_pain_agent.reply_writer import (
     build_reply_drafts_markdown,
     draft_reply_suggestions,
     load_reply_source_posts,
+    score_comment_opportunities,
 )
 from reddit_pain_agent.ranking import (
     analyze_comment_screening,
@@ -75,6 +78,7 @@ from reddit_pain_agent.ranking import (
     rank_candidates,
     rank_run_candidates,
     score_candidate_post,
+    score_thread_comment_opportunity,
 )
 from reddit_pain_agent.retrieval import (
     apply_candidate_quality_filters,
@@ -154,14 +158,40 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.model, "openai/gpt-oss-20b")
         self.assertEqual(config.request_timeout_seconds, 45.0)
 
+    def test_load_llm_config_supports_openai(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "LLM_PROVIDER": "openai",
+                "OPENAI_API_KEY": "test-key",
+                "LLM_MODEL": "gpt-5.2",
+            },
+            clear=True,
+        ):
+            config = load_llm_config(require_model=True)
+
+        self.assertEqual(config.provider, "openai")
+        self.assertEqual(config.base_url, "https://api.openai.com/v1")
+        self.assertEqual(config.model, "gpt-5.2")
+        self.assertEqual(config.api_key, "test-key")
+
     def test_load_llm_config_rejects_unsupported_provider(self) -> None:
         with patch.dict(
             "os.environ",
-            {"LLM_PROVIDER": "openai"},
+            {"LLM_PROVIDER": "anthropic"},
             clear=True,
         ):
             with self.assertRaises(ConfigurationError):
                 load_llm_config()
+
+    def test_load_llm_config_requires_openai_api_key(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"LLM_PROVIDER": "openai", "LLM_MODEL": "gpt-5.2"},
+            clear=True,
+        ):
+            with self.assertRaises(ConfigurationError):
+                load_llm_config(require_model=True)
 
 
 class ArtifactStoreTests(unittest.TestCase):
@@ -215,15 +245,33 @@ class ArtifactStoreTests(unittest.TestCase):
     def test_artifact_store_writes_summary_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             store = build_artifact_store(Path(tmpdir), "run-2")
-            prompt_path = store.write_prompt_text("candidate summary", "Prompt text")
-            raw_response_path = store.write_raw_llm_response("candidate summary", {"id": "resp_1"})
-            store.write_evidence_summary_markdown("# Evidence Summary\n")
-            store.write_evidence_summary_json({"provider": "lmstudio"})
+            generation = AssetGenerationProvenance(provider="lmstudio", model="test-model")
+            prompt_path = store.write_prompt_text("candidate summary", "Prompt text", generation=generation)
+            generation = generation.model_copy(update={"prompt_artifact_path": prompt_path})
+            raw_response_path = store.write_raw_llm_response(
+                "candidate summary",
+                {"id": "resp_1"},
+                generation=generation,
+            )
+            generation = generation.model_copy(update={"raw_response_artifact_path": raw_response_path})
+            store.write_evidence_summary_markdown("# Evidence Summary\n", generation=generation)
+            store.write_evidence_summary_json({"provider": "lmstudio"}, generation=generation)
+            registry = json.loads(store.asset_registry_path.read_text(encoding="utf-8"))
+            registry_by_path = {item["artifact_path"]: item for item in registry}
 
             self.assertTrue((store.run_dir / prompt_path).exists())
             self.assertTrue((store.run_dir / raw_response_path).exists())
             self.assertTrue(store.evidence_summary_markdown_path.exists())
             self.assertTrue(store.evidence_summary_json_path.exists())
+            self.assertEqual(
+                registry_by_path["evidence_summary.json"]["generation"],
+                {
+                    "provider": "lmstudio",
+                    "model": "test-model",
+                    "prompt_artifact_path": prompt_path,
+                    "raw_response_artifact_path": raw_response_path,
+                },
+            )
 
     def test_artifact_store_writes_comment_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -293,6 +341,13 @@ class ArtifactStoreTests(unittest.TestCase):
 
             self.assertTrue(store.reply_drafts_json_path.exists())
             self.assertTrue(store.reply_drafts_markdown_path.exists())
+
+    def test_artifact_store_writes_comment_opportunities_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = build_artifact_store(Path(tmpdir), "run-9")
+            store.write_comment_opportunities_json({"scored_post_count": 1, "opportunities": []})
+
+            self.assertTrue(store.comment_opportunities_json_path.exists())
 
 
 class RetrievalNormalizationTests(unittest.TestCase):
@@ -1079,6 +1134,7 @@ class PlaywrightCaptureTests(unittest.TestCase):
                     url="https://reddit.com/a",
                     score=10,
                     num_comments=2,
+                    created_utc=1710000000,
                     source_queries=["manual follow-up pain"],
                     source_subreddits=["Entrepreneur"],
                     source_sorts=["comments"],
@@ -1093,6 +1149,7 @@ class PlaywrightCaptureTests(unittest.TestCase):
                     url="https://reddit.com/a",
                     score=12,
                     num_comments=3,
+                    created_utc=1712000000,
                     source_queries=["spreadsheet crm pain"],
                     source_subreddits=["Entrepreneur"],
                     source_sorts=["new"],
@@ -1106,6 +1163,7 @@ class PlaywrightCaptureTests(unittest.TestCase):
         self.assertEqual(len(merged), 1)
         self.assertEqual(merged[0].score, 12)
         self.assertEqual(merged[0].num_comments, 3)
+        self.assertEqual(merged[0].created_utc, 1712000000)
         self.assertEqual([comment.id for comment in merged[0].comments], ["c1", "c2"])
         self.assertEqual(
             merged[0].source_queries,
@@ -1139,6 +1197,7 @@ class PlaywrightCaptureTests(unittest.TestCase):
                     "subreddit": "Entrepreneur",
                     "url": "https://www.reddit.com/r/Entrepreneur/comments/abc123/example/",
                     "permalink": "/r/Entrepreneur/comments/abc123/example/",
+                    "created_utc": 1775600000,
                     "selftext": "Still using spreadsheets.",
                     "num_comments": 1,
                     "comments": [
@@ -1147,6 +1206,7 @@ class PlaywrightCaptureTests(unittest.TestCase):
                             "body": "Same issue here",
                             "score": 5,
                             "depth": 0,
+                            "created_utc": 1775600300,
                         }
                     ],
                 }
@@ -1199,9 +1259,64 @@ class PlaywrightCaptureTests(unittest.TestCase):
             self.assertEqual(result.html_snapshot_count, 2)
             self.assertEqual(result.screenshot_count, 2)
             self.assertEqual(result.page_error_count, 0)
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["posts"][0]["created_utc"], 1775600000)
+            self.assertEqual(payload["posts"][0]["comments"][0]["created_utc"], 1775600300)
             log_text = result.log_path.read_text(encoding="utf-8")
             self.assertIn('"event": "search_page_extracted"', log_text)
             self.assertIn('"event": "thread_page_extracted"', log_text)
+
+    def test_repair_capture_timestamps_backfills_from_saved_html(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            capture_json_path = Path(tmpdir) / "manual_capture.json"
+            snapshot_dir = Path(tmpdir) / "manual_capture"
+            snapshot_dir.mkdir(parents=True, exist_ok=True)
+            _write_json_file(
+                capture_json_path,
+                {
+                    "source": "playwright",
+                    "posts": [
+                        {
+                            "id": "abc123",
+                            "title": "Manual follow-up is painful",
+                            "subreddit": "Entrepreneur",
+                            "url": "https://www.reddit.com/r/Entrepreneur/comments/abc123/example/",
+                            "created_utc": None,
+                            "comments": [
+                                {
+                                    "id": "c1",
+                                    "body": "Same issue here",
+                                    "created_utc": None,
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+            (snapshot_dir / "thread-001.html").write_text(
+                (
+                    '<shreddit-post id="t3_abc123" created-timestamp="2026-04-07T12:00:00.000000+0000"></shreddit-post>'
+                    '<shreddit-comment created="2026-04-07T12:05:00.000000+0000" thingid="t1_c1"></shreddit-comment>'
+                ),
+                encoding="utf-8",
+            )
+
+            result = repair_capture_timestamps(
+                capture_json_path=capture_json_path,
+                snapshot_dir=snapshot_dir,
+            )
+
+            repaired_payload = json.loads(capture_json_path.read_text(encoding="utf-8"))
+            self.assertEqual(result.repaired_post_count, 1)
+            self.assertEqual(result.repaired_comment_count, 1)
+            self.assertAlmostEqual(
+                repaired_payload["posts"][0]["created_utc"],
+                datetime(2026, 4, 7, 12, 0, tzinfo=UTC).timestamp(),
+            )
+            self.assertAlmostEqual(
+                repaired_payload["posts"][0]["comments"][0]["created_utc"],
+                datetime(2026, 4, 7, 12, 5, tzinfo=UTC).timestamp(),
+            )
 
 
 class LLMTests(unittest.TestCase):
@@ -1264,6 +1379,17 @@ class LLMTests(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_build_llm_client_supports_openai_provider(self) -> None:
+        config = LLMConfig(
+            provider="openai",
+            base_url="https://api.openai.com/v1",
+            model="gpt-5.2",
+            api_key="test-key",
+            request_timeout_seconds=60.0,
+        )
+        client = build_llm_client(config)
+        self.assertIsInstance(client, LMStudioClient)
+
 
 class PromptAndSummaryTests(unittest.TestCase):
     def test_build_candidate_evidence_prompt_includes_post_fields(self) -> None:
@@ -1288,11 +1414,12 @@ class PromptAndSummaryTests(unittest.TestCase):
                 ]
             },
         )
-        self.assertIn("## Repeated Complaints", prompt)
+        self.assertIn("## Candidate Pain Themes", prompt)
         self.assertIn("Title: Painful workflow", prompt)
         self.assertIn("Queries: manual work", prompt)
         self.assertIn("Representative Comments:", prompt)
         self.assertIn("I have this exact issue", prompt)
+        self.assertIn("# Research Context", prompt)
 
     def test_build_final_memo_prompt_includes_theme_summary_and_sections(self) -> None:
         prompt = build_final_memo_prompt(
@@ -1320,10 +1447,11 @@ class PromptAndSummaryTests(unittest.TestCase):
             ],
             evidence_summary_text="## Repeated Complaints\n\nManual follow-up keeps showing up.",
         )
-        self.assertIn("# Executive Summary", prompt)
-        self.assertIn("## Top 5 Product Ideas", prompt)
+        self.assertIn("## Topic Overview", prompt)
+        self.assertIn("## Product Opportunities", prompt)
         self.assertIn("cluster_id: cluster-1", prompt)
         self.assertIn("Manual follow-up keeps showing up.", prompt)
+        self.assertIn("# Research Context", prompt)
 
     def test_build_reply_drafts_prompt_includes_voice_and_post_ids(self) -> None:
         prompt = build_reply_drafts_prompt(
@@ -1393,10 +1521,18 @@ class PromptAndSummaryTests(unittest.TestCase):
                 cohesion_score=0.41,
             ),
             included_post_count=5,
+            topic="manual follow-up pain",
+            target_audience="founder-led sales teams",
+            category="business",
+            time_horizon="recent",
+            source_thread_urls=["https://reddit.com/a", "https://reddit.com/b"],
         )
         self.assertIn("# Final Memo", markdown)
         self.assertIn("strongest_cluster_id: cluster-1", markdown)
         self.assertIn("posts_used: 5", markdown)
+        self.assertIn("topic: manual follow-up pain", markdown)
+        self.assertIn("## Source Threads", markdown)
+        self.assertIn("https://reddit.com/a", markdown)
         self.assertIn("The theme is real.", markdown)
 
     def test_build_reply_drafts_markdown_renders_manual_review_metadata(self) -> None:
@@ -1507,6 +1643,34 @@ class PromptAndSummaryTests(unittest.TestCase):
 
         self.assertEqual(len(posts), 1)
         self.assertEqual(posts[0].candidate.id, "abc123")
+
+    def test_load_reply_source_posts_prioritizes_high_value_comment_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir)
+            (run_dir / "selected_posts.json").write_text(
+                (
+                    '[{"candidate":{"id":"weak","title":"What tools do people use for outreach",'
+                    '"subreddit":"Entrepreneur","url":"https://reddit.com/weak","selftext":"Curious what people use.",'
+                    '"source_queries":["manual follow-up pain"],"created_utc":1700000000},"saved_comment_count":0,"breakdown":{"total_score":9.0},"rank":1},'
+                    '{"candidate":{"id":"strong","title":"We still miss leads because manual follow-up is killing our workflow",'
+                    '"subreddit":"Entrepreneur","url":"https://reddit.com/strong","selftext":"I need to fix this now.",'
+                    '"source_queries":["manual follow-up pain"],"created_utc":1775450000},"saved_comment_count":0,"breakdown":{"total_score":7.0},"rank":2}]'
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "comments").mkdir(parents=True, exist_ok=True)
+            (run_dir / "comments" / "strong.json").write_text(
+                (
+                    '{"submission_id":"strong","subreddit":"Entrepreneur","title":"x","fetched_comment_count":2,'
+                    '"comments":[{"id":"c1","body":"We still do this manually and it slows everything down.","score":5,"depth":0},'
+                    '{"id":"c2","body":"Same issue here, we keep missing people because the workflow breaks.","score":4,"depth":0}]}'
+                ),
+                encoding="utf-8",
+            )
+
+            posts = load_reply_source_posts(run_dir)
+
+        self.assertEqual(posts[0].candidate.id, "strong")
 
     def test_load_summary_posts_prefers_strongest_cluster_over_selected_posts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1820,6 +1984,37 @@ class PromptAndSummaryTests(unittest.TestCase):
         self.assertTrue(artifact.passed_threshold)
         self.assertEqual(artifact.drafts[0].passed_threshold, True)
 
+    def test_score_comment_opportunities_writes_ranked_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir)
+            (run_dir / "selected_posts.json").write_text(
+                (
+                    '[{"candidate":{"id":"weak","title":"What tools do people use for outreach",'
+                    '"subreddit":"Entrepreneur","url":"https://reddit.com/weak","selftext":"Curious what people use.",'
+                    '"source_queries":["manual follow-up pain"],"created_utc":1700000000},"saved_comment_count":0,"breakdown":{"total_score":9.0},"rank":1},'
+                    '{"candidate":{"id":"strong","title":"We still miss leads because manual follow-up is killing our workflow",'
+                    '"subreddit":"Entrepreneur","url":"https://reddit.com/strong","selftext":"I need to fix this now.",'
+                    '"source_queries":["manual follow-up pain"],"created_utc":1775450000},"saved_comment_count":0,"breakdown":{"total_score":7.0},"rank":2}]'
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "comments").mkdir(parents=True, exist_ok=True)
+            (run_dir / "comments" / "strong.json").write_text(
+                (
+                    '{"submission_id":"strong","subreddit":"Entrepreneur","title":"x","fetched_comment_count":2,'
+                    '"comments":[{"id":"c1","body":"We still do this manually and it slows everything down.","score":5,"depth":0},'
+                    '{"id":"c2","body":"Same issue here, we keep missing people because the workflow breaks.","score":4,"depth":0}]}'
+                ),
+                encoding="utf-8",
+            )
+
+            artifact = score_comment_opportunities(run_dir, max_posts=2)
+
+            self.assertEqual(artifact.scored_post_count, 2)
+            self.assertEqual(artifact.opportunities[0].post_id, "strong")
+            self.assertTrue((run_dir / "comment_opportunities.json").exists())
+            self.assertIn(artifact.opportunities[0].bucket, {"high_value", "watchlist"})
+
 
 class RankingTests(unittest.TestCase):
     def test_comment_screening_detects_non_trivial_and_complaint_signals(self) -> None:
@@ -1880,6 +2075,53 @@ class RankingTests(unittest.TestCase):
             now=now,
         )
         self.assertGreater(strong.total_score, weak.total_score)
+
+    def test_score_thread_comment_opportunity_prefers_recent_painful_confirmed_threads(self) -> None:
+        now = datetime(2026, 4, 7, tzinfo=UTC)
+        weak = score_thread_comment_opportunity(
+            CandidatePost(
+                id="weak",
+                title="What tools are people using for outreach",
+                subreddit="Entrepreneur",
+                url="https://reddit.com/weak",
+                selftext="Curious what everyone likes.",
+                source_queries=["manual follow-up pain"],
+                created_utc=1700000000,
+            ),
+            saved_comments=[],
+            now=now,
+        )
+        strong = score_thread_comment_opportunity(
+            CandidatePost(
+                id="strong",
+                title="We still miss leads because manual follow-up is killing our workflow",
+                subreddit="Entrepreneur",
+                url="https://reddit.com/strong",
+                selftext="I need to fix this now because the process does not scale.",
+                source_queries=["manual follow-up pain"],
+                created_utc=1775450000,
+                num_comments=8,
+            ),
+            saved_comments=[
+                Comment(
+                    id="c1",
+                    body="We still do this manually and it slows everything down every week.",
+                    score=5,
+                    depth=0,
+                ),
+                Comment(
+                    id="c2",
+                    body="Same issue here, we keep missing people because the workflow breaks when things get busy.",
+                    score=4,
+                    depth=0,
+                ),
+            ],
+            now=now,
+        )
+
+        self.assertGreater(strong.total_score, weak.total_score)
+        self.assertEqual(strong.recommendation, "high_value")
+        self.assertIn(weak.recommendation, {"ignore", "watchlist"})
 
     def test_rank_candidates_sorts_and_assigns_ranks(self) -> None:
         ranked = rank_candidates(
@@ -2167,6 +2409,16 @@ class MemoWriterTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            (run_dir / "manifest.json").write_text(
+                (
+                    '{"run_slug":"run-1","status":"completed","started_at":"2026-04-02T00:00:00Z",'
+                    '"completed_at":"2026-04-02T00:10:00Z","output_dir":"x","topic":"manual follow-up pain",'
+                    '"target_audience":"founder-led sales teams","category":"business","time_horizon":"recent",'
+                    '"subreddits":["Entrepreneur"],"queries":["manual follow-up pain"],"sort":"relevance",'
+                    '"time_filter":"month","limit":25,"request_timeout_seconds":30.0,"max_retries":3,"max_concurrent_requests":4}'
+                ),
+                encoding="utf-8",
+            )
 
             artifact = asyncio.run(
                 write_final_memo(
@@ -2178,10 +2430,16 @@ class MemoWriterTests(unittest.TestCase):
             )
 
             self.assertEqual(artifact.strongest_cluster_id, "cluster-1")
+            self.assertEqual(artifact.topic, "manual follow-up pain")
+            self.assertEqual(artifact.target_audience, "founder-led sales teams")
+            self.assertEqual(artifact.source_thread_urls[0], "https://reddit.com/a")
             self.assertTrue((run_dir / "final_memo.json").exists())
             self.assertTrue((run_dir / "final_memo.md").exists())
             self.assertTrue((run_dir / "prompts" / "final-memo.txt").exists())
             self.assertTrue((run_dir / "raw" / "llm" / "final-memo.json").exists())
+            final_markdown = (run_dir / "final_memo.md").read_text(encoding="utf-8")
+            self.assertIn("## Source Threads", final_markdown)
+            self.assertIn("https://reddit.com/e", final_markdown)
 
     def test_write_final_memo_fails_for_weak_cluster(self) -> None:
         class FakeLMStudioClient:
@@ -3985,8 +4243,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("cluster_evidence_valid: yes", output)
         self.assertIn("cluster_evidence_validation_json:", output)
 
-    def test_llm_models_cli_prints_lmstudio_models(self) -> None:
-        class FakeLMStudioClient:
+    def test_llm_models_cli_prints_openai_models(self) -> None:
+        class FakeLLMClient:
             def __init__(self, config):
                 self.config = config
 
@@ -4002,22 +4260,22 @@ class CliTests(unittest.TestCase):
         with patch.dict(
             "os.environ",
             {
-                "LLM_PROVIDER": "lmstudio",
-                "LLM_BASE_URL": "http://127.0.0.1:1234/v1",
+                "LLM_PROVIDER": "openai",
+                "OPENAI_API_KEY": "test-key",
             },
             clear=True,
         ):
-            with patch("reddit_pain_agent.main.LMStudioClient", FakeLMStudioClient):
+            with patch("reddit_pain_agent.main.LMStudioClient", FakeLLMClient):
                 with patch("sys.stdout.write") as stdout_write:
                     exit_code = main(["llm", "models"])
 
         self.assertEqual(exit_code, 0)
         output = "".join(call.args[0] for call in stdout_write.call_args_list)
-        self.assertIn("provider: lmstudio", output)
+        self.assertIn("provider: openai", output)
         self.assertIn("openai/gpt-oss-20b", output)
 
     def test_llm_prompt_cli_prints_generated_text(self) -> None:
-        class FakeLMStudioClient:
+        class FakeLLMClient:
             def __init__(self, config):
                 self.config = config
 
@@ -4033,21 +4291,21 @@ class CliTests(unittest.TestCase):
         with patch.dict(
             "os.environ",
             {
-                "LLM_PROVIDER": "lmstudio",
-                "LLM_BASE_URL": "http://127.0.0.1:1234/v1",
-                "LLM_MODEL": "openai/gpt-oss-20b",
+                "LLM_PROVIDER": "openai",
+                "OPENAI_API_KEY": "test-key",
+                "LLM_MODEL": "gpt-5.2",
             },
             clear=True,
         ):
-            with patch("reddit_pain_agent.main.LMStudioClient", FakeLMStudioClient):
+            with patch("reddit_pain_agent.main.LMStudioClient", FakeLLMClient):
                 with patch("sys.stdout.write") as stdout_write:
                     exit_code = main(["llm", "prompt", "--prompt", "test prompt"])
 
         self.assertEqual(exit_code, 0)
         output = "".join(call.args[0] for call in stdout_write.call_args_list)
-        self.assertIn("provider: lmstudio", output)
-        self.assertIn("model: openai/gpt-oss-20b", output)
-        self.assertIn("echo:test prompt:openai/gpt-oss-20b", output)
+        self.assertIn("provider: openai", output)
+        self.assertIn("model: gpt-5.2", output)
+        self.assertIn("echo:test prompt:gpt-5.2", output)
 
     def test_summarize_cli_writes_summary_artifacts(self) -> None:
         class FakeLMStudioClient:
@@ -4139,6 +4397,17 @@ class CliTests(unittest.TestCase):
             self.assertTrue((run_dir / "evidence_summary.md").exists())
             self.assertTrue((run_dir / "prompts" / "candidate-evidence-summary.txt").exists())
             self.assertTrue((run_dir / "raw" / "llm" / "candidate-evidence-summary.json").exists())
+            registry = json.loads((run_dir / "asset_registry.json").read_text(encoding="utf-8"))
+            registry_by_path = {item["artifact_path"]: item for item in registry}
+            self.assertEqual(
+                registry_by_path["evidence_summary.json"]["generation"],
+                {
+                    "provider": "lmstudio",
+                    "model": "openai/gpt-oss-20b",
+                    "prompt_artifact_path": "prompts/candidate-evidence-summary.txt",
+                    "raw_response_artifact_path": "raw/llm/candidate-evidence-summary.json",
+                },
+            )
 
         output = "".join(call.args[0] for call in stdout_write.call_args_list)
         self.assertIn("comment_selection_json:", output)
@@ -4232,6 +4501,17 @@ class CliTests(unittest.TestCase):
             self.assertTrue((run_dir / "final_memo.md").exists())
             self.assertTrue((run_dir / "prompts" / "final-memo.txt").exists())
             self.assertTrue((run_dir / "raw" / "llm" / "final-memo.json").exists())
+            registry = json.loads((run_dir / "asset_registry.json").read_text(encoding="utf-8"))
+            registry_by_path = {item["artifact_path"]: item for item in registry}
+            self.assertEqual(
+                registry_by_path["final_memo.md"]["generation"],
+                {
+                    "provider": "lmstudio",
+                    "model": "openai/gpt-oss-20b",
+                    "prompt_artifact_path": "prompts/final-memo.txt",
+                    "raw_response_artifact_path": "raw/llm/final-memo.json",
+                },
+            )
 
         output = "".join(call.args[0] for call in stdout_write.call_args_list)
         self.assertIn("strongest_cluster_id: cluster-1", output)
@@ -4335,12 +4615,65 @@ class CliTests(unittest.TestCase):
             self.assertEqual(exit_code, 0)
             self.assertTrue((run_dir / "reply_drafts.json").exists())
             self.assertTrue((run_dir / "reply_drafts.md").exists())
+            registry = json.loads((run_dir / "asset_registry.json").read_text(encoding="utf-8"))
+            registry_by_path = {item["artifact_path"]: item for item in registry}
+            self.assertEqual(
+                registry_by_path["reply_drafts.json"]["generation"],
+                {
+                    "provider": "lmstudio",
+                    "model": "openai/gpt-oss-20b",
+                    "prompt_artifact_path": "prompts/reply-drafts.txt",
+                    "raw_response_artifact_path": "raw/llm/reply-drafts.json",
+                },
+            )
 
         output = "".join(call.args[0] for call in stdout_write.call_args_list)
         self.assertIn("manual_review_only: yes", output)
         self.assertIn("reply_drafts_json:", output)
         self.assertIn("selected_posts: 1", output)
         self.assertIn("passed_threshold: yes", output)
+
+    def test_comment_opportunities_cli_writes_scored_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir) / "run-1"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "selected_posts.json").write_text(
+                (
+                    '[{"candidate":{"id":"strong","title":"We still miss leads because manual follow-up is killing our workflow",'
+                    '"subreddit":"Entrepreneur","url":"https://reddit.com/strong","selftext":"I need to fix this now.",'
+                    '"source_queries":["manual follow-up pain"],"created_utc":1775450000},'
+                    '"saved_comment_count":0,"breakdown":{"total_score":7.0},"rank":1}]'
+                ),
+                encoding="utf-8",
+            )
+            (run_dir / "comments").mkdir(parents=True, exist_ok=True)
+            (run_dir / "comments" / "strong.json").write_text(
+                (
+                    '{"submission_id":"strong","subreddit":"Entrepreneur","title":"x","fetched_comment_count":2,'
+                    '"comments":[{"id":"c1","body":"We still do this manually and it slows everything down.","score":5,"depth":0},'
+                    '{"id":"c2","body":"Same issue here, we keep missing people because the workflow breaks.","score":4,"depth":0}]}'
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("sys.stdout.write") as stdout_write:
+                exit_code = main(
+                    [
+                        "comment-opportunities",
+                        "--run-dir",
+                        str(run_dir),
+                        "--max-posts",
+                        "1",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((run_dir / "comment_opportunities.json").exists())
+
+        output = "".join(call.args[0] for call in stdout_write.call_args_list)
+        self.assertIn("scored_posts: 1", output)
+        self.assertIn("opportunity: post_id=strong", output)
+        self.assertIn("comment_opportunities_json:", output)
 
     def test_comment_enrichment_expands_morechildren_bounded(self) -> None:
         class FakeRedditClient:

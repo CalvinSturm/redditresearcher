@@ -21,6 +21,7 @@ ALLOWED_SORTS = {"comments", "hot", "new", "relevance", "top"}
 ALLOWED_TIME_FILTERS = {"all", "day", "hour", "month", "week", "year"}
 DEFAULT_LLM_PROVIDER = "lmstudio"
 DEFAULT_LMSTUDIO_BASE_URL = "http://127.0.0.1:1234/v1"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS = 60.0
 
 
@@ -207,21 +208,31 @@ def load_runtime_config(output_root_override: str | Path | None = None) -> Runti
 
 def load_llm_config(require_model: bool = False) -> LLMConfig:
     provider = (_read_env("LLM_PROVIDER", DEFAULT_LLM_PROVIDER) or DEFAULT_LLM_PROVIDER).lower()
-    if provider != "lmstudio":
+    if provider not in {"lmstudio", "openai"}:
         raise ConfigurationError(
-            "Unsupported LLM_PROVIDER. Supported values: lmstudio"
+            "Unsupported LLM_PROVIDER. Supported values: lmstudio, openai"
         )
 
     model = _read_env("LLM_MODEL")
     if require_model and model is None:
         raise ConfigurationError("Missing required environment variable: LLM_MODEL")
 
-    base_url = _read_env("LLM_BASE_URL", DEFAULT_LMSTUDIO_BASE_URL) or DEFAULT_LMSTUDIO_BASE_URL
+    default_base_url = (
+        DEFAULT_LMSTUDIO_BASE_URL if provider == "lmstudio" else DEFAULT_OPENAI_BASE_URL
+    )
+    base_url = _read_env("LLM_BASE_URL", default_base_url) or default_base_url
+    api_key = _read_env("LLM_API_KEY")
+    if provider == "openai" and api_key is None:
+        api_key = _read_env("OPENAI_API_KEY")
+    if provider == "openai" and api_key is None:
+        raise ConfigurationError(
+            "Missing required environment variable: OPENAI_API_KEY or LLM_API_KEY"
+        )
     return LLMConfig(
         provider=provider,
         base_url=base_url.rstrip("/"),
         model=model,
-        api_key=_read_env("LLM_API_KEY"),
+        api_key=api_key,
         request_timeout_seconds=_parse_positive_float(
             _read_env("LLM_REQUEST_TIMEOUT_SECONDS"),
             "LLM_REQUEST_TIMEOUT_SECONDS",

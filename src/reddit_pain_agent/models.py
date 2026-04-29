@@ -215,6 +215,10 @@ class RunManifest(BaseModel):
     output_dir: str
     retrieval_mode: Literal["api", "manual"] = "api"
     manual_input_path: str | None = None
+    topic: str | None = None
+    target_audience: str | None = None
+    category: Literal["software", "business", "ergonomics"] | None = None
+    time_horizon: str | None = None
     subreddits: list[str]
     queries: list[str]
     query_variants: list[str] = Field(default_factory=list)
@@ -238,6 +242,7 @@ class RunManifest(BaseModel):
     candidate_count: int = 0
     filtered_counts: dict[str, int] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+    brief_path: str | None = None
 
 
 class LLMGenerationResult(BaseModel):
@@ -246,6 +251,21 @@ class LLMGenerationResult(BaseModel):
     prompt: str
     output_text: str
     raw_response: dict
+
+
+class AssetGenerationProvenance(BaseModel):
+    provider: str | None = None
+    model: str | None = None
+    prompt_artifact_path: str | None = None
+    raw_response_artifact_path: str | None = None
+
+
+class RegisteredAsset(BaseModel):
+    artifact_path: str
+    artifact_type: str
+    created_at: datetime
+    generation: AssetGenerationProvenance | None = None
+    metadata: dict[str, object] = Field(default_factory=dict)
 
 
 class EvidenceSummaryArtifact(BaseModel):
@@ -271,6 +291,13 @@ class FinalMemoArtifact(BaseModel):
     strongest_cluster_id: str
     strongest_cluster_size: int
     included_post_count: int
+    topic: str | None = None
+    target_audience: str | None = None
+    category: Literal["software", "business", "ergonomics"] | None = None
+    time_horizon: str | None = None
+    source_thread_urls: list[str] = Field(default_factory=list)
+    passed_validation: bool = True
+    validation_issues: list[str] = Field(default_factory=list)
     prompt_artifact_path: str
     raw_response_artifact_path: str
     final_memo_artifact_path: str
@@ -283,6 +310,8 @@ class ReplyDraft(BaseModel):
     subreddit: str
     url: str
     rank: int | None = None
+    comment_opportunity_score: float | None = None
+    comment_opportunity_bucket: Literal["high_value", "watchlist", "ignore"] | None = None
     reply_text: str
     relevance_score: float | None = None
     conversation_value_score: float | None = None
@@ -304,10 +333,54 @@ class ReplyDraftArtifact(BaseModel):
     score_threshold: float = 4.0
     minimum_dimension_score: float = 3.0
     passed_threshold: bool = False
+    passed_validation: bool = True
+    output_validation_issues: list[str] = Field(default_factory=list)
     prompt_artifact_path: str
     raw_response_artifact_path: str
     reply_markdown_artifact_path: str
     drafts: list[ReplyDraft] = Field(default_factory=list)
+
+
+class CommentOpportunity(BaseModel):
+    post_id: str
+    title: str
+    subreddit: str
+    url: str
+    rank: int | None = None
+    total_score: float
+    bucket: Literal["high_value", "watchlist", "ignore"]
+    breakdown: ThreadCommentOpportunityBreakdown
+
+
+class CommentOpportunityArtifact(BaseModel):
+    run_dir: str
+    generated_at: datetime
+    scored_post_count: int
+    opportunities: list[CommentOpportunity] = Field(default_factory=list)
+
+
+class ReviewCheckpointArtifact(BaseModel):
+    run_dir: str
+    review_type: Literal["memo", "reply"]
+    status: Literal["pending", "approved", "rejected"] = "pending"
+    created_at: datetime
+    updated_at: datetime
+    artifact_path: str | None = None
+    notes: str | None = None
+    context: dict[str, object] = Field(default_factory=dict)
+
+
+class ResearchBrief(BaseModel):
+    path: str | None = None
+    topic: str | None = None
+    target_audience: str | None = None
+    preferred_subreddits: list[str] = Field(default_factory=list)
+    avoid_subreddits: list[str] = Field(default_factory=list)
+    queries: list[str] = Field(default_factory=list)
+    category: Literal["software", "business", "ergonomics"] | None = None
+    time_horizon: str | None = None
+    success_criteria: list[str] = Field(default_factory=list)
+    notes: str | None = None
 
 
 class RunStageReport(BaseModel):
@@ -391,6 +464,19 @@ class CommentScreeningBreakdown(BaseModel):
     complaint_signal_comment_count: int = 0
 
 
+class ThreadCommentOpportunityBreakdown(BaseModel):
+    strong_pain_score: float = 0.0
+    first_person_urgency_score: float = 0.0
+    discussion_confirmation_score: float = 0.0
+    freshness_score: float = 0.0
+    icp_fit_score: float = 0.0
+    source_quality_score: float = 0.0
+    engagement_safety_score: float = 0.0
+    total_score: float = 0.0
+    recommendation: Literal["high_value", "watchlist", "ignore"] = "ignore"
+    safe_to_engage: bool = False
+
+
 class CandidateScreeningDecision(BaseModel):
     candidate: CandidatePost
     kept: bool
@@ -416,6 +502,7 @@ class PostScoreBreakdown(BaseModel):
     comment_richness_score: float = 0.0
     text_richness_score: float = 0.0
     recency_score: float = 0.0
+    source_quality_penalty: float = 0.0
     penalty_score: float = 0.0
     total_score: float = 0.0
 
@@ -448,6 +535,18 @@ class ThemeCluster(BaseModel):
     top_terms: list[str] = Field(default_factory=list)
     member_ranks: list[int] = Field(default_factory=list)
     cohesion_score: float = 0.0
+    source_thread_urls: list[str] = Field(default_factory=list)
+    source_subreddits: list[str] = Field(default_factory=list)
+    cross_subreddit_count: int = 0
+    minimum_theme_size_met: bool | None = None
+    opportunity_score: float = 0.0
+    opportunity_recommendation: Literal["strong", "moderate", "weak"] = "weak"
+
+    @model_validator(mode="after")
+    def _default_minimum_theme_size_met(self) -> "ThemeCluster":
+        if self.minimum_theme_size_met is None:
+            self.minimum_theme_size_met = self.size >= 5
+        return self
 
 
 class ClusterEvidenceMember(BaseModel):
@@ -478,4 +577,33 @@ class ThemeSummaryArtifact(BaseModel):
     cluster_count: int
     strongest_cluster_id: str | None = None
     strongest_post_ids: list[str] = Field(default_factory=list)
+    valid_cluster_count: int = 0
+    invalid_cluster_count: int = 0
     clusters: list[ThemeCluster] = Field(default_factory=list)
+
+
+class RunMemoryEntry(BaseModel):
+    run_slug: str
+    run_dir: str
+    status: str | None = None
+    topic: str | None = None
+    target_audience: str | None = None
+    category: str | None = None
+    time_horizon: str | None = None
+    strongest_cluster_id: str | None = None
+    strongest_cluster_label: str | None = None
+    strongest_cluster_size: int = 0
+    strongest_cluster_opportunity_score: float = 0.0
+    strongest_cluster_opportunity_recommendation: str | None = None
+    source_thread_count: int = 0
+    memo_validation_passed: bool | None = None
+    reply_review_status: str | None = None
+    memo_review_status: str | None = None
+    completed_at: datetime | None = None
+
+
+class RunMemoryArtifact(BaseModel):
+    generated_at: datetime
+    runs_root: str
+    run_count: int
+    entries: list[RunMemoryEntry] = Field(default_factory=list)

@@ -4,7 +4,9 @@ import argparse
 import asyncio
 from datetime import UTC, datetime
 import hashlib
+import json
 from pathlib import Path
+import re
 import sys
 from time import perf_counter
 
@@ -25,10 +27,18 @@ from .config import (
 from .clustering import cluster_run_posts
 from .llm import LMStudioClient
 from .memo_writer import write_final_memo
-from .models import RunReportArtifact, RunStageReport
+from .models import (
+    ResearchBrief,
+    ReviewCheckpointArtifact,
+    RunMemoryArtifact,
+    RunMemoryEntry,
+    RunReportArtifact,
+    RunStageReport,
+    ThemeSummaryArtifact,
+)
 from .pain_analysis import summarize_candidate_posts
 from .playwright_capture import capture_reddit_threads
-from .reply_writer import draft_reply_suggestions
+from .reply_writer import draft_reply_suggestions, load_review_checkpoint, score_comment_opportunities
 from .ranking import rank_run_candidates
 from .retrieval import (
     enrich_run_with_comments,
@@ -104,8 +114,12 @@ def _build_run_output_paths(run_dir: Path) -> dict[str, str]:
         "evidence_summary": str(run_dir / "evidence_summary.json"),
         "final_memo": str(run_dir / "final_memo.md"),
         "final_memo_json": str(run_dir / "final_memo.json"),
+        "comment_opportunities": str(run_dir / "comment_opportunities.json"),
         "reply_drafts": str(run_dir / "reply_drafts.md"),
         "reply_drafts_json": str(run_dir / "reply_drafts.json"),
+        "memo_review": str(run_dir / "review_memo.json"),
+        "reply_review": str(run_dir / "review_reply.json"),
+        "asset_registry": str(run_dir / "asset_registry.json"),
         "run_report": str(run_dir / "run_report.json"),
     }
 
@@ -123,6 +137,10 @@ def _stage_params_from_args(args: argparse.Namespace) -> dict[str, dict[str, obj
         "search": {
             "search_mode": "manual" if manual_input else "api",
             "manual_input_path": str(manual_input) if manual_input else None,
+            "topic": getattr(args, "topic", None),
+            "target_audience": getattr(args, "target_audience", None),
+            "category": getattr(args, "category", None),
+            "time_horizon": getattr(args, "time_horizon", None),
             "subreddits": list(args.subreddits),
             "queries": list(args.queries),
             "sort": args.sort,
@@ -259,6 +277,10 @@ def _normalize_search_stage_params(payload: object) -> dict[str, object]:
     normalized = dict(payload) if isinstance(payload, dict) else {}
     normalized.setdefault("search_mode", "api")
     normalized.setdefault("manual_input_path", None)
+    normalized.setdefault("topic", None)
+    normalized.setdefault("target_audience", None)
+    normalized.setdefault("category", None)
+    normalized.setdefault("time_horizon", None)
     return normalized
 
 
@@ -266,6 +288,10 @@ def _should_run_stage(resumed_from_stage: str | None, stage: str) -> bool:
     if resumed_from_stage is None:
         return True
     return STAGE_ORDER.index(stage) >= STAGE_ORDER.index(resumed_from_stage)
+
+
+def _normalized_filtered_counts(value: object) -> dict[str, int]:
+    return value if isinstance(value, dict) else {}
 
 
 def _write_run_report(
@@ -285,9 +311,11 @@ def _write_run_report(
     stop_reason: str | None = None,
     error: str | None = None,
 ) -> Path:
+    writable_run_dir = isinstance(run_dir, (str, Path))
+    normalized_run_dir = Path(run_dir) if writable_run_dir else Path(".")
     artifact = RunReportArtifact(
-        run_slug=run_slug,
-        run_dir=str(run_dir),
+        run_slug=str(run_slug),
+        run_dir=str(normalized_run_dir),
         status=status,
         started_at=started_at,
         completed_at=datetime.now(UTC),
@@ -301,9 +329,11 @@ def _write_run_report(
         stop_reason=stop_reason,
         error=error,
         stage_reports=stage_reports,
-        output_paths=_build_run_output_paths(run_dir),
+        output_paths=_build_run_output_paths(normalized_run_dir),
     )
-    store = ArtifactStore(run_dir)
+    if not writable_run_dir:
+        return normalized_run_dir / "run_report.json"
+    store = ArtifactStore(normalized_run_dir)
     store.write_run_report_json(artifact.model_dump(mode="json"))
     return store.run_report_json_path
 
@@ -377,6 +407,18 @@ def build_parser() -> argparse.ArgumentParser:
         dest="queries",
         required=True,
         help="Search query to run within each target subreddit",
+    )
+    search_parser.add_argument("--topic", help="Human-readable research topic label for downstream synthesis")
+    search_parser.add_argument("--target-audience", help="Optional target audience label for downstream synthesis")
+    search_parser.add_argument(
+        "--category",
+        choices=["software", "business", "ergonomics"],
+        help="Optional research category label",
+    )
+    search_parser.add_argument(
+        "--time-horizon",
+        choices=["recent", "last year", "all time"],
+        help="Optional analyst-facing time horizon label for downstream synthesis",
     )
     search_parser.add_argument("--sort", default=DEFAULT_SORT, help="Reddit search sort")
     search_parser.add_argument(
@@ -622,6 +664,18 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Search query to run within each target subreddit",
     )
+    run_parser.add_argument("--topic", help="Human-readable research topic label for downstream synthesis")
+    run_parser.add_argument("--target-audience", help="Optional target audience label for downstream synthesis")
+    run_parser.add_argument(
+        "--category",
+        choices=["software", "business", "ergonomics"],
+        help="Optional research category label",
+    )
+    run_parser.add_argument(
+        "--time-horizon",
+        choices=["recent", "last year", "all time"],
+        help="Optional analyst-facing time horizon label for downstream synthesis",
+    )
     run_parser.add_argument("--sort", default=DEFAULT_SORT, help="Reddit search sort")
     run_parser.add_argument(
         "--time-filter",
@@ -833,6 +887,18 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Seed query metadata to attach to imported posts",
     )
+    manual_import_parser.add_argument("--topic", help="Human-readable research topic label for downstream synthesis")
+    manual_import_parser.add_argument("--target-audience", help="Optional target audience label for downstream synthesis")
+    manual_import_parser.add_argument(
+        "--category",
+        choices=["software", "business", "ergonomics"],
+        help="Optional research category label",
+    )
+    manual_import_parser.add_argument(
+        "--time-horizon",
+        choices=["recent", "last year", "all time"],
+        help="Optional analyst-facing time horizon label for downstream synthesis",
+    )
     manual_import_parser.add_argument("--sort", default=DEFAULT_SORT, help="Source search sort metadata")
     manual_import_parser.add_argument(
         "--time-filter",
@@ -1035,6 +1101,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of strongest-cluster posts to include in the memo prompt",
     )
 
+    comment_opportunities_parser = subparsers.add_parser(
+        "comment-opportunities",
+        help="Score saved run threads for how valuable they are to comment on",
+    )
+    comment_opportunities_parser.add_argument(
+        "--run-dir",
+        type=Path,
+        required=True,
+        help="Path to a run directory containing selected_posts.json or candidate_posts.json",
+    )
+    comment_opportunities_parser.add_argument(
+        "--max-posts",
+        type=int,
+        default=10,
+        help="Maximum number of scored threads to include in the saved artifact and terminal output",
+    )
+
     reply_parser = subparsers.add_parser(
         "reply-drafts",
         help="Draft Reddit-friendly reply suggestions for manual review from the top saved run posts",
@@ -1115,6 +1198,10 @@ def main(argv: list[str] | None = None) -> int:
                     config=config,
                     subreddits=args.subreddits,
                     queries=args.queries,
+                    topic=args.topic,
+                    target_audience=args.target_audience,
+                    category=args.category,
+                    time_horizon=args.time_horizon,
                     sort=args.sort,
                     time_filter=args.time_filter,
                     additional_sorts=args.additional_sorts,
@@ -1238,6 +1325,10 @@ def main(argv: list[str] | None = None) -> int:
                 output_root=output_root,
                 subreddits=args.subreddits,
                 queries=args.queries,
+                topic=args.topic,
+                target_audience=args.target_audience,
+                category=args.category,
+                time_horizon=args.time_horizon,
                 sort=args.sort,
                 time_filter=args.time_filter,
                 limit=args.limit,
@@ -1382,10 +1473,11 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"sorts: {search_result.sort_count}")
                     print(f"time_filters: {search_result.time_filter_count}")
                     print(f"pages_per_query: {search_result.pages_per_query}")
-                    if search_result.filtered_counts:
+                    filtered_counts = _normalized_filtered_counts(search_result.filtered_counts)
+                    if filtered_counts:
                         filtered_summary = ", ".join(
                             f"{reason}={count}"
-                            for reason, count in sorted(search_result.filtered_counts.items())
+                            for reason, count in sorted(filtered_counts.items())
                         )
                         print(f"filtered: {filtered_summary}")
                     else:
@@ -1405,6 +1497,10 @@ def main(argv: list[str] | None = None) -> int:
                         output_root=output_root,
                         subreddits=args.subreddits,
                         queries=args.queries,
+                        topic=args.topic,
+                        target_audience=args.target_audience,
+                        category=args.category,
+                        time_horizon=args.time_horizon,
                         sort=args.sort,
                         time_filter=args.time_filter,
                         limit=args.limit,
@@ -1423,6 +1519,10 @@ def main(argv: list[str] | None = None) -> int:
                             config=runtime_config,
                             subreddits=args.subreddits,
                             queries=args.queries,
+                            topic=args.topic,
+                            target_audience=args.target_audience,
+                            category=args.category,
+                            time_horizon=args.time_horizon,
                             sort=args.sort,
                             time_filter=args.time_filter,
                             additional_sorts=args.additional_sorts,
@@ -1675,9 +1775,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 print(f"requests: {search_result.request_count}")
                 print(f"candidate_posts: {search_result.candidate_count}")
-                if search_result.filtered_counts:
+                filtered_counts = _normalized_filtered_counts(search_result.filtered_counts)
+                if filtered_counts:
                     filtered_summary = ", ".join(
-                        f"{reason}={count}" for reason, count in sorted(search_result.filtered_counts.items())
+                        f"{reason}={count}" for reason, count in sorted(filtered_counts.items())
                     )
                     print(f"filtered: {filtered_summary}")
                 else:
@@ -2012,9 +2113,10 @@ def main(argv: list[str] | None = None) -> int:
             "candidate_posts: "
             f"{next((item.details.get('candidate_count', 0) for item in stage_reports if item.stage == 'search'), 0)}"
         )
-        if search_result.filtered_counts:
+        filtered_counts = _normalized_filtered_counts(search_result.filtered_counts)
+        if filtered_counts:
             filtered_summary = ", ".join(
-                f"{reason}={count}" for reason, count in sorted(search_result.filtered_counts.items())
+                f"{reason}={count}" for reason, count in sorted(filtered_counts.items())
             )
             print(f"filtered: {filtered_summary}")
         else:
@@ -2100,8 +2202,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "llm":
         try:
             config = load_llm_config(require_model=args.llm_command == "prompt" and not args.model)
-            if config.provider != "lmstudio":
-                raise ConfigurationError("Unsupported LLM provider")
 
             async def _run_llm_command() -> int:
                 async with LMStudioClient(config) as client:
@@ -2265,6 +2365,32 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(f"Memo generation failed: {exc}", file=sys.stderr)
             return 1
+
+    if args.command == "comment-opportunities":
+        try:
+            if args.max_posts <= 0:
+                raise ValueError("--max-posts must be greater than 0")
+            artifact = score_comment_opportunities(
+                args.run_dir,
+                max_posts=args.max_posts,
+            )
+        except (ValueError, FileNotFoundError) as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:
+            print(f"Comment opportunity scoring failed: {exc}", file=sys.stderr)
+            return 1
+
+        print(f"run_dir: {artifact.run_dir}")
+        print(f"scored_posts: {artifact.scored_post_count}")
+        for item in artifact.opportunities:
+            print(
+                "opportunity: "
+                f"post_id={item.post_id} bucket={item.bucket} score={item.total_score:.3f} "
+                f"subreddit={item.subreddit} title={item.title} url={item.url}"
+            )
+        print(f"comment_opportunities_json: {args.run_dir / 'comment_opportunities.json'}")
+        return 0
 
     if args.command == "reply-drafts":
         try:

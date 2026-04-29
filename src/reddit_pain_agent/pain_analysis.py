@@ -7,13 +7,15 @@ import re
 
 from .artifact_store import ArtifactStore
 from .clustering import load_strongest_cluster_posts
-from .llm import LMStudioClient
+from .llm import LLMClient
 from .models import (
+    AssetGenerationProvenance,
     CandidatePost,
     Comment,
     CommentSelectionArtifact,
     CommentSelectionBreakdown,
     EvidenceSummaryArtifact,
+    RunManifest,
     SelectedCommentEvidence,
     SubmissionCommentsArtifact,
 )
@@ -53,6 +55,14 @@ def load_submission_comments(run_dir: Path) -> dict[str, list[Comment]]:
         artifact = SubmissionCommentsArtifact.model_validate(payload)
         comments_by_submission[artifact.submission_id] = artifact.comments
     return comments_by_submission
+
+
+def load_run_manifest(run_dir: Path) -> RunManifest | None:
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return RunManifest.model_validate(payload)
 
 
 def select_comment_evidence(
@@ -129,7 +139,7 @@ def score_comment_for_evidence(comment: Comment) -> CommentSelectionBreakdown:
 
 async def summarize_candidate_posts(
     run_dir: Path,
-    client: LMStudioClient,
+    client: LLMClient,
     model: str | None = None,
     max_posts: int = 10,
     max_comments_per_post: int = 3,
@@ -137,6 +147,7 @@ async def summarize_candidate_posts(
     store = ArtifactStore(run_dir)
     posts = load_summary_posts(run_dir)
     comments_by_submission = load_submission_comments(run_dir)
+    manifest = load_run_manifest(run_dir)
     selected_comments_by_submission = select_comment_evidence(
         posts,
         comments_by_submission,
@@ -158,15 +169,31 @@ async def summarize_candidate_posts(
             ]
             for submission_id, selected_items in selected_comments_by_submission.items()
         },
+        research_context=manifest,
         max_posts=max_posts,
         max_comments_per_post=max_comments_per_post,
     )
     generation = await client.generate_response(prompt, model=model)
+    generation_metadata = AssetGenerationProvenance(
+        provider=generation.provider,
+        model=generation.model,
+    )
 
-    prompt_artifact_path = store.write_prompt_text("candidate_evidence_summary", prompt)
+    prompt_artifact_path = store.write_prompt_text(
+        "candidate_evidence_summary",
+        prompt,
+        generation=generation_metadata,
+    )
+    generation_metadata = generation_metadata.model_copy(
+        update={"prompt_artifact_path": prompt_artifact_path}
+    )
     raw_response_artifact_path = store.write_raw_llm_response(
         "candidate_evidence_summary",
         generation.raw_response,
+        generation=generation_metadata,
+    )
+    generation_metadata = generation_metadata.model_copy(
+        update={"raw_response_artifact_path": raw_response_artifact_path}
     )
     summary_markdown = build_evidence_summary_markdown(
         generation.output_text,
@@ -182,7 +209,10 @@ async def summarize_candidate_posts(
             for post in posts[:max_posts]
         ),
     )
-    store.write_evidence_summary_markdown(summary_markdown)
+    store.write_evidence_summary_markdown(
+        summary_markdown,
+        generation=generation_metadata,
+    )
     comment_selection_artifact = CommentSelectionArtifact(
         run_dir=str(run_dir),
         generated_at=datetime.now(UTC),
@@ -219,7 +249,10 @@ async def summarize_candidate_posts(
         ),
         summary_text=generation.output_text,
     )
-    store.write_evidence_summary_json(artifact.model_dump(mode="json"))
+    store.write_evidence_summary_json(
+        artifact.model_dump(mode="json"),
+        generation=generation_metadata,
+    )
     return artifact
 
 

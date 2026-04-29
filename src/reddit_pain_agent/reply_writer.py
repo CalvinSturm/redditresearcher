@@ -8,14 +8,24 @@ from typing import Any
 
 from .artifact_store import ArtifactStore
 from .clustering import load_strongest_cluster_posts
-from .llm import LMStudioClient
-from .models import CandidatePost, RankedCandidatePost, ReplyDraft, ReplyDraftArtifact
+from .llm import LLMClient
+from .models import (
+    AssetGenerationProvenance,
+    CandidatePost,
+    CommentOpportunity,
+    CommentOpportunityArtifact,
+    RankedCandidatePost,
+    ReplyDraft,
+    ReplyDraftArtifact,
+    ReviewCheckpointArtifact,
+    RunManifest,
+)
 from .prompts import (
     build_reply_drafts_prompt,
     build_reply_evaluation_prompt,
     build_reply_improvement_prompt,
 )
-from .ranking import load_selected_ranked_posts
+from .ranking import load_selected_ranked_posts, load_submission_comments, score_thread_comment_opportunity
 
 
 DEFAULT_REPLY_SCORE_THRESHOLD = 4.0
@@ -26,11 +36,11 @@ DEFAULT_REPLY_MAX_IMPROVEMENT_ROUNDS = 3
 def load_reply_source_posts(run_dir: Path) -> list[RankedCandidatePost]:
     ranked_posts = load_selected_ranked_posts(run_dir)
     if ranked_posts:
-        return ranked_posts
+        return _rank_posts_for_reply_opportunity(run_dir, ranked_posts)
 
     strongest_cluster_posts = load_strongest_cluster_posts(run_dir)
     if strongest_cluster_posts:
-        return [
+        ranked_cluster_posts = [
             RankedCandidatePost(
                 candidate=post,
                 saved_comment_count=0,
@@ -39,6 +49,7 @@ def load_reply_source_posts(run_dir: Path) -> list[RankedCandidatePost]:
             )
             for index, post in enumerate(strongest_cluster_posts, start=1)
         ]
+        return _rank_posts_for_reply_opportunity(run_dir, ranked_cluster_posts)
 
     candidate_posts_path = run_dir / "candidate_posts.json"
     if not candidate_posts_path.exists():
@@ -47,7 +58,7 @@ def load_reply_source_posts(run_dir: Path) -> list[RankedCandidatePost]:
     if not isinstance(payload, list):
         raise ValueError("candidate_posts.json must contain a list")
     candidates = [CandidatePost.model_validate(item) for item in payload]
-    return [
+    ranked_candidates = [
         RankedCandidatePost(
             candidate=candidate,
             saved_comment_count=0,
@@ -56,11 +67,64 @@ def load_reply_source_posts(run_dir: Path) -> list[RankedCandidatePost]:
         )
         for index, candidate in enumerate(candidates, start=1)
     ]
+    return _rank_posts_for_reply_opportunity(run_dir, ranked_candidates)
+
+
+def load_run_manifest(run_dir: Path) -> RunManifest | None:
+    path = run_dir / "manifest.json"
+    if not path.exists():
+        return None
+    return RunManifest.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def load_review_checkpoint(run_dir: Path, review_type: str) -> ReviewCheckpointArtifact | None:
+    path = run_dir / ("review_memo.json" if review_type == "memo" else "review_reply.json")
+    if not path.exists():
+        return None
+    return ReviewCheckpointArtifact.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def score_comment_opportunities(
+    run_dir: Path,
+    *,
+    max_posts: int = 10,
+) -> CommentOpportunityArtifact:
+    if max_posts <= 0:
+        raise ValueError("--max-posts must be greater than 0")
+
+    store = ArtifactStore(run_dir)
+    source_posts = load_reply_source_posts(run_dir)[:max_posts]
+    opportunities: list[CommentOpportunity] = []
+    for post in source_posts:
+        score = _comment_opportunity_score(post) or 0.0
+        bucket = _comment_opportunity_bucket(post) or "ignore"
+        breakdown = _comment_opportunity_breakdown(post)
+        opportunities.append(
+            CommentOpportunity(
+                post_id=post.candidate.id,
+                title=post.candidate.title,
+                subreddit=post.candidate.subreddit,
+                url=post.candidate.url,
+                rank=post.rank,
+                total_score=score,
+                bucket=bucket,
+                breakdown=breakdown,
+            )
+        )
+
+    artifact = CommentOpportunityArtifact(
+        run_dir=str(run_dir),
+        generated_at=datetime.now(UTC),
+        scored_post_count=len(opportunities),
+        opportunities=opportunities,
+    )
+    store.write_comment_opportunities_json(artifact.model_dump(mode="json"))
+    return artifact
 
 
 async def draft_reply_suggestions(
     run_dir: Path,
-    client: LMStudioClient,
+    client: LLMClient,
     *,
     voice: str,
     model: str | None = None,
@@ -140,15 +204,37 @@ async def draft_reply_suggestions(
         current_output = generation.output_text
 
     drafts = _parse_reply_drafts(current_output, selected_posts, evaluations)
-    prompt_artifact_path = store.write_prompt_text("reply_drafts", final_prompt_text)
-    raw_response_artifact_path = store.write_raw_llm_response("reply_drafts", generation.raw_response)
+    validation_issues = {
+        draft.post_id: validate_reply_text(draft.reply_text)
+        for draft in drafts
+    }
+    generation_metadata = AssetGenerationProvenance(
+        provider=generation.provider,
+        model=generation.model,
+    )
+    prompt_artifact_path = store.write_prompt_text(
+        "reply_drafts",
+        final_prompt_text,
+        generation=generation_metadata,
+    )
+    generation_metadata = generation_metadata.model_copy(
+        update={"prompt_artifact_path": prompt_artifact_path}
+    )
+    raw_response_artifact_path = store.write_raw_llm_response(
+        "reply_drafts",
+        generation.raw_response,
+        generation=generation_metadata,
+    )
+    generation_metadata = generation_metadata.model_copy(
+        update={"raw_response_artifact_path": raw_response_artifact_path}
+    )
     markdown = build_reply_drafts_markdown(
         drafts,
         provider=generation.provider,
         model=generation.model,
         voice=voice,
     )
-    store.write_reply_drafts_markdown(markdown)
+    store.write_reply_drafts_markdown(markdown, generation=generation_metadata)
 
     artifact = ReplyDraftArtifact(
         run_dir=str(run_dir),
@@ -161,12 +247,21 @@ async def draft_reply_suggestions(
         score_threshold=score_threshold,
         minimum_dimension_score=minimum_dimension_score,
         passed_threshold=passed_threshold,
+        passed_validation=all(not issues for issues in validation_issues.values()),
+        output_validation_issues=[
+            f"{post_id}:{issue}"
+            for post_id, issues in validation_issues.items()
+            for issue in issues
+        ],
         prompt_artifact_path=prompt_artifact_path,
         raw_response_artifact_path=raw_response_artifact_path,
         reply_markdown_artifact_path=str(store.reply_drafts_markdown_path.relative_to(store.run_dir)),
         drafts=drafts,
     )
-    store.write_reply_drafts_json(artifact.model_dump(mode="json"))
+    store.write_reply_drafts_json(
+        artifact.model_dump(mode="json"),
+        generation=generation_metadata,
+    )
     return artifact
 
 
@@ -238,6 +333,8 @@ def _parse_reply_drafts(
                 subreddit=candidate.subreddit,
                 url=candidate.url,
                 rank=post.rank,
+                comment_opportunity_score=_comment_opportunity_score(post),
+                comment_opportunity_bucket=_comment_opportunity_bucket(post),
                 reply_text=reply_text,
                 relevance_score=evaluation.relevance_score if evaluation else None,
                 conversation_value_score=evaluation.conversation_value_score if evaluation else None,
@@ -263,6 +360,53 @@ def _normalize_reply_text(reply_text: str) -> str:
     if not normalized_paragraphs:
         return ""
     return "\n\n".join(normalized_paragraphs)
+
+
+def _rank_posts_for_reply_opportunity(
+    run_dir: Path,
+    posts: list[RankedCandidatePost],
+) -> list[RankedCandidatePost]:
+    comments_by_submission = load_submission_comments(run_dir)
+    manifest = load_run_manifest(run_dir)
+    scored_posts: list[tuple[float, str, int, RankedCandidatePost]] = []
+    now = datetime.now(UTC)
+    for post in posts:
+        opportunity = score_thread_comment_opportunity(
+            post.candidate,
+            saved_comments=comments_by_submission.get(post.candidate.id, []),
+            now=now,
+            research_context=manifest,
+        )
+        post.candidate.__dict__["_comment_opportunity_score"] = opportunity.total_score
+        post.candidate.__dict__["_comment_opportunity_bucket"] = opportunity.recommendation
+        post.candidate.__dict__["_comment_opportunity_breakdown"] = opportunity
+        scored_posts.append((opportunity.total_score, opportunity.recommendation, -(post.rank or 0), post))
+    recommendation_order = {"high_value": 2, "watchlist": 1, "ignore": 0}
+    scored_posts.sort(
+        key=lambda item: (
+            recommendation_order.get(item[1], 0),
+            item[0],
+            item[3].breakdown.total_score,
+            -(item[3].rank or 0),
+        ),
+        reverse=True,
+    )
+    return [item[3] for item in scored_posts]
+
+
+def _comment_opportunity_score(post: RankedCandidatePost) -> float | None:
+    value = post.candidate.__dict__.get("_comment_opportunity_score")
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _comment_opportunity_bucket(post: RankedCandidatePost) -> str | None:
+    value = post.candidate.__dict__.get("_comment_opportunity_bucket")
+    return value if isinstance(value, str) else None
+
+
+def _comment_opportunity_breakdown(post: RankedCandidatePost):
+    value = post.candidate.__dict__.get("_comment_opportunity_breakdown")
+    return value
 
 
 class _ReplyEvaluation:
@@ -381,3 +525,15 @@ def _coerce_score(value: Any) -> float:
     except (TypeError, ValueError):
         return 2.5
     return max(1.0, min(score, 5.0))
+
+
+def validate_reply_text(reply_text: str) -> list[str]:
+    issues: list[str] = []
+    paragraphs = [paragraph.strip() for paragraph in re.split(r"\n\s*\n", reply_text.strip()) if paragraph.strip()]
+    if len(paragraphs) < 1 or len(paragraphs) > 3:
+        issues.append("paragraph_count")
+    if re.search(r"(?m)^\s*(?:[-*]|\d+\.)\s+", reply_text):
+        issues.append("bullet_formatting")
+    if re.search(r"(?m)^\s*#{1,6}\s+", reply_text):
+        issues.append("heading_formatting")
+    return issues

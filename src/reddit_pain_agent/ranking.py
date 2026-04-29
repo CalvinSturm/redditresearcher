@@ -18,6 +18,8 @@ from .models import (
     PostScoreBreakdown,
     RankedCandidatePost,
     SubmissionCommentsArtifact,
+    ThreadCommentOpportunityBreakdown,
+    RunManifest,
 )
 
 
@@ -42,6 +44,28 @@ COMPLAINT_SIGNAL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 FIRST_PERSON_PATTERN = re.compile(r"\b(i|we|my|our|me|us)\b", re.IGNORECASE)
+URGENCY_SIGNAL_PATTERN = re.compile(
+    r"\b("
+    r"now|right now|asap|urgent|immediately|today|this week|stuck|blocked|missing|"
+    r"slipping|killing|slow|hard to scale|doesn'?t scale|too long|hours|manual"
+    r")\b",
+    re.IGNORECASE,
+)
+SELF_PROMO_PATTERN = re.compile(
+    r"\b("
+    r"launched|launching|built|building|my startup|our startup|our tool|my tool|"
+    r"check out|try it|sign up|demo|waitlist|free trial|roast my|feedback on my|"
+    r"promo code|discount"
+    r")\b",
+    re.IGNORECASE,
+)
+SPAM_SIGNAL_PATTERN = re.compile(
+    r"\b("
+    r"dm me|book a call|schedule a call|buy now|limited time|link in bio|"
+    r"subscribe|newsletter|affiliate|referral"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def rank_run_candidates(
@@ -247,6 +271,7 @@ def score_candidate_post(
 ) -> PostScoreBreakdown:
     text_blob = " ".join([candidate.title, candidate.selftext]).lower()
     text_tokens = _tokenize(text_blob)
+    source_quality_penalty = _source_quality_penalty(candidate)
 
     query_relevance_score = 0.0
     for query in candidate.source_queries:
@@ -294,6 +319,7 @@ def score_candidate_post(
         + comment_richness_score
         + text_richness_score
         + recency_score
+        + source_quality_penalty
         + penalty_score
     )
 
@@ -303,8 +329,129 @@ def score_candidate_post(
         comment_richness_score=round(comment_richness_score, 3),
         text_richness_score=round(text_richness_score, 3),
         recency_score=round(recency_score, 3),
+        source_quality_penalty=round(source_quality_penalty, 3),
         penalty_score=round(penalty_score, 3),
         total_score=round(total_score, 3),
+    )
+
+
+def score_thread_comment_opportunity(
+    candidate: CandidatePost,
+    *,
+    saved_comments: list[Comment],
+    now: datetime,
+    research_context: RunManifest | None = None,
+) -> ThreadCommentOpportunityBreakdown:
+    post_text = " ".join(part for part in [candidate.title, candidate.selftext] if part).strip()
+    lower_post_text = post_text.lower()
+    screening = analyze_comment_screening(saved_comments)
+
+    strong_pain_score = 0.0
+    if COMPLAINT_SIGNAL_PATTERN.search(lower_post_text):
+        strong_pain_score = 1.0
+    elif screening.complaint_signal_comment_count >= 2:
+        strong_pain_score = 1.0
+    elif screening.complaint_signal_comment_count >= 1 or "problem" in lower_post_text or "pain" in lower_post_text:
+        strong_pain_score = 0.5
+
+    first_person_urgency_score = 0.0
+    post_has_first_person = bool(FIRST_PERSON_PATTERN.search(lower_post_text))
+    post_has_urgency = bool(URGENCY_SIGNAL_PATTERN.search(lower_post_text))
+    if post_has_first_person and post_has_urgency:
+        first_person_urgency_score = 1.0
+    elif any(
+        FIRST_PERSON_PATTERN.search(comment.body) and URGENCY_SIGNAL_PATTERN.search(comment.body)
+        for comment in saved_comments
+        if comment.body.strip()
+    ):
+        first_person_urgency_score = 1.0
+    elif post_has_first_person or post_has_urgency:
+        first_person_urgency_score = 0.5
+
+    discussion_confirmation_score = 0.0
+    if screening.complaint_signal_comment_count >= 2 or screening.non_trivial_comment_count >= 3:
+        discussion_confirmation_score = 1.0
+    elif screening.complaint_signal_comment_count >= 1 or screening.non_trivial_comment_count >= 1:
+        discussion_confirmation_score = 0.5
+    elif (candidate.num_comments or 0) >= 5:
+        discussion_confirmation_score = 0.5
+
+    freshness_score = 0.0
+    if candidate.created_utc is not None:
+        created_at = datetime.fromtimestamp(candidate.created_utc, tz=UTC)
+        age_days = max((now - created_at).total_seconds() / 86400.0, 0.0)
+        if age_days <= 3:
+            freshness_score = 1.0
+        elif age_days <= 14:
+            freshness_score = 0.75
+        elif age_days <= 30:
+            freshness_score = 0.5
+        elif age_days <= 90:
+            freshness_score = 0.25
+
+    icp_fit_score = 0.0
+    post_tokens = _tokenize(post_text)
+    query_overlap = 0.0
+    fit_queries = list(candidate.source_queries)
+    if research_context is not None:
+        if research_context.topic:
+            fit_queries.append(research_context.topic)
+        if research_context.target_audience:
+            fit_queries.append(research_context.target_audience)
+    for query in fit_queries:
+        query_tokens = _tokenize(query)
+        if not query_tokens:
+            continue
+        query_overlap = max(query_overlap, len(post_tokens.intersection(query_tokens)) / len(query_tokens))
+    if query_overlap >= 0.6:
+        icp_fit_score = 1.0
+    elif query_overlap >= 0.3:
+        icp_fit_score = 0.5
+
+    source_quality_score = 1.0
+    if _has_spam_signal(candidate):
+        source_quality_score = 0.0
+    elif _has_self_promo_signal(candidate):
+        source_quality_score = 0.5
+
+    engagement_safety_score = 0.0
+    if freshness_score >= 0.75 and source_quality_score >= 0.5 and strong_pain_score >= 0.5:
+        engagement_safety_score = 1.0
+    elif freshness_score >= 0.5 and source_quality_score >= 0.5:
+        engagement_safety_score = 0.5
+
+    total_score = round(
+        strong_pain_score
+        + first_person_urgency_score
+        + discussion_confirmation_score
+        + freshness_score
+        + icp_fit_score,
+        3,
+    )
+    total_score = round(total_score + source_quality_score + engagement_safety_score, 3)
+    safe_to_engage = (
+        engagement_safety_score >= 0.5
+        and source_quality_score >= 0.5
+        and strong_pain_score >= 0.5
+    )
+    if safe_to_engage and total_score >= 5.5:
+        recommendation = "high_value"
+    elif total_score >= 4.0:
+        recommendation = "watchlist"
+    else:
+        recommendation = "ignore"
+
+    return ThreadCommentOpportunityBreakdown(
+        strong_pain_score=round(strong_pain_score, 3),
+        first_person_urgency_score=round(first_person_urgency_score, 3),
+        discussion_confirmation_score=round(discussion_confirmation_score, 3),
+        freshness_score=round(freshness_score, 3),
+        icp_fit_score=round(icp_fit_score, 3),
+        source_quality_score=round(source_quality_score, 3),
+        engagement_safety_score=round(engagement_safety_score, 3),
+        total_score=total_score,
+        recommendation=recommendation,
+        safe_to_engage=safe_to_engage,
     )
 
 
@@ -349,3 +496,22 @@ def load_selected_ranked_posts(run_dir: Path) -> list[RankedCandidatePost]:
 
 def _tokenize(text: str) -> set[str]:
     return {token for token in re.findall(r"\b[a-z0-9]{3,}\b", text.lower())}
+
+
+def _source_quality_penalty(candidate: CandidatePost) -> float:
+    penalty = 0.0
+    if _has_self_promo_signal(candidate):
+        penalty -= 0.75
+    if _has_spam_signal(candidate):
+        penalty -= 1.0
+    return penalty
+
+
+def _has_self_promo_signal(candidate: CandidatePost) -> bool:
+    text = " ".join(part for part in [candidate.title, candidate.selftext] if part)
+    return bool(SELF_PROMO_PATTERN.search(text))
+
+
+def _has_spam_signal(candidate: CandidatePost) -> bool:
+    text = " ".join(part for part in [candidate.title, candidate.selftext] if part)
+    return bool(SPAM_SIGNAL_PATTERN.search(text))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from typing import Protocol
 
 import httpx
 
@@ -19,14 +20,27 @@ class LLMModelInfo:
     owned_by: str | None = None
 
 
-class LMStudioClient:
+class LLMClient(Protocol):
+    async def __aenter__(self) -> "LLMClient": ...
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None: ...
+    async def close(self) -> None: ...
+    async def list_models(self) -> list[LLMModelInfo]: ...
+    async def generate_text(self, prompt: str, model: str | None = None) -> str: ...
+    async def generate_response(
+        self,
+        prompt: str,
+        model: str | None = None,
+    ) -> LLMGenerationResult: ...
+
+
+class ResponsesAPIClient:
     def __init__(
         self,
         config: LLMConfig,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        if config.provider != "lmstudio":
-            raise ValueError("LMStudioClient requires provider='lmstudio'")
+        if config.provider not in {"lmstudio", "openai"}:
+            raise ValueError("ResponsesAPIClient requires provider='lmstudio' or 'openai'")
 
         headers = {"Content-Type": "application/json"}
         if config.api_key:
@@ -39,7 +53,7 @@ class LMStudioClient:
             headers=headers,
         )
 
-    async def __aenter__(self) -> "LMStudioClient":
+    async def __aenter__(self) -> "ResponsesAPIClient":
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
@@ -54,23 +68,23 @@ class LMStudioClient:
             response.raise_for_status()
         except httpx.TimeoutException as exc:
             raise LLMClientError(
-                f"LM Studio request timed out after {self._config.request_timeout_seconds:.0f}s while listing models at "
+                f"{_provider_label(self._config.provider)} request timed out after {self._config.request_timeout_seconds:.0f}s while listing models at "
                 f"{self._config.base_url}/models"
             ) from exc
         except httpx.HTTPStatusError as exc:
             raise LLMClientError(
-                f"LM Studio returned HTTP {exc.response.status_code} while listing models at "
+                f"{_provider_label(self._config.provider)} returned HTTP {exc.response.status_code} while listing models at "
                 f"{self._config.base_url}/models"
             ) from exc
         except httpx.RequestError as exc:
             raise LLMClientError(
-                f"LM Studio request failed while listing models at {self._config.base_url}/models: "
+                f"{_provider_label(self._config.provider)} request failed while listing models at {self._config.base_url}/models: "
                 f"{exc.__class__.__name__}"
             ) from exc
         payload = response.json()
         items = payload.get("data")
         if not isinstance(items, list):
-            raise LLMClientError("LM Studio /models response missing data list")
+            raise LLMClientError(f"{_provider_label(self._config.provider)} /models response missing data list")
 
         models: list[LLMModelInfo] = []
         for item in items:
@@ -106,23 +120,23 @@ class LMStudioClient:
             response.raise_for_status()
         except httpx.TimeoutException as exc:
             raise LLMClientError(
-                f"LM Studio request timed out after {self._config.request_timeout_seconds:.0f}s while generating with model "
+                f"{_provider_label(self._config.provider)} request timed out after {self._config.request_timeout_seconds:.0f}s while generating with model "
                 f"{selected_model}. Increase LLM_REQUEST_TIMEOUT_SECONDS or reduce prompt size."
             ) from exc
         except httpx.HTTPStatusError as exc:
             raise LLMClientError(
-                f"LM Studio returned HTTP {exc.response.status_code} for model {selected_model}: "
+                f"{_provider_label(self._config.provider)} returned HTTP {exc.response.status_code} for model {selected_model}: "
                 f"{_safe_response_preview(exc.response)}"
             ) from exc
         except httpx.RequestError as exc:
             raise LLMClientError(
-                f"LM Studio request failed for model {selected_model} at {self._config.base_url}/responses: "
+                f"{_provider_label(self._config.provider)} request failed for model {selected_model} at {self._config.base_url}/responses: "
                 f"{exc.__class__.__name__}"
             ) from exc
         payload = response.json()
         text = extract_response_text(payload)
         if not text:
-            raise LLMClientError("LM Studio response did not contain output text")
+            raise LLMClientError(f"{_provider_label(self._config.provider)} response did not contain output text")
         return LLMGenerationResult(
             provider=self._config.provider,
             model=selected_model,
@@ -130,6 +144,16 @@ class LMStudioClient:
             output_text=text,
             raw_response=payload,
         )
+
+
+LMStudioClient = ResponsesAPIClient
+
+
+def build_llm_client(
+    config: LLMConfig,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> ResponsesAPIClient:
+    return ResponsesAPIClient(config, transport=transport)
 
 
 def extract_response_text(payload: dict[str, Any]) -> str:
@@ -164,3 +188,9 @@ def _safe_response_preview(response: httpx.Response, max_chars: int = 160) -> st
     if len(body) > max_chars:
         return body[:max_chars].strip() + "..."
     return body
+
+
+def _provider_label(provider: str) -> str:
+    if provider == "openai":
+        return "OpenAI"
+    return "LM Studio"

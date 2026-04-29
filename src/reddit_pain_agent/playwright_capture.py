@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+import re
 import tempfile
 from typing import Any, Protocol
 from urllib.parse import quote_plus, urlparse, urlunparse
@@ -58,6 +59,28 @@ SEARCH_PAGE_EXTRACTION_SCRIPT = """
 THREAD_PAGE_EXTRACTION_SCRIPT = """
 () => {
   const cleanText = (value) => (value || "").replace(/\\s+/g, " ").trim();
+  const coerceIsoToUnixSeconds = (value) => {
+    const raw = cleanText(value);
+    if (!raw) {
+      return null;
+    }
+    const parsed = Date.parse(raw);
+    if (Number.isNaN(parsed)) {
+      return null;
+    }
+    return parsed / 1000;
+  };
+  const coerceMillisToUnixSeconds = (value) => {
+    const raw = cleanText(value);
+    if (!raw) {
+      return null;
+    }
+    const numeric = Number(raw);
+    if (!Number.isFinite(numeric)) {
+      return null;
+    }
+    return numeric > 1e12 ? numeric / 1000 : numeric;
+  };
   const canonical = document.querySelector('link[rel="canonical"]')?.href || window.location.href;
   const normalizedCanonical = (() => {
     try {
@@ -89,6 +112,11 @@ THREAD_PAGE_EXTRACTION_SCRIPT = """
     cleanText(postNode?.querySelector('[data-post-click-location="text-body"]')?.innerText) ||
     cleanText(document.querySelector('[slot="text-body"]')?.innerText) ||
     "";
+  const createdUtc =
+    coerceIsoToUnixSeconds(postNode?.getAttribute("created-timestamp")) ||
+    coerceMillisToUnixSeconds(postNode?.getAttribute("created_timestamp")) ||
+    coerceMillisToUnixSeconds(document.querySelector("shreddit-screenview-data")?.getAttribute("data")?.match(/"created_timestamp":(\\d+)/)?.[1]) ||
+    coerceIsoToUnixSeconds(postNode?.querySelector("time")?.getAttribute("datetime"));
   const bodyText = cleanText(postNode?.innerText || document.body.innerText || "");
   const commentNodes = Array.from(
     document.querySelectorAll("shreddit-comment, article[id^='t1_'], div[id^='t1_'], [data-testid='comment']")
@@ -112,12 +140,16 @@ THREAD_PAGE_EXTRACTION_SCRIPT = """
       cleanText(node.querySelector('a[href^="/user/"], a[href*="/u/"]')?.textContent) ||
       null;
     const permalinkHref = node.querySelector('a[href*="/comments/"]')?.href || null;
+    const created =
+      coerceIsoToUnixSeconds(node.getAttribute("created")) ||
+      coerceIsoToUnixSeconds(node.querySelector("time")?.getAttribute("datetime"));
     comments.push({
       id,
       body,
       author,
       permalink: permalinkHref,
-      depth: null
+      depth: null,
+      created_utc: created
     });
   }
   return {
@@ -127,6 +159,7 @@ THREAD_PAGE_EXTRACTION_SCRIPT = """
     url: normalizedCanonical,
     permalink,
     selftext,
+    created_utc: createdUtc,
     num_comments: comments.length,
     over_18: /nsfw/i.test(bodyText) || /over18/i.test(document.body.innerHTML),
     comments
@@ -172,6 +205,14 @@ class CaptureSessionPaths:
     output_path: Path
     log_path: Path
     snapshot_dir: Path
+
+
+@dataclass(frozen=True)
+class CaptureTimestampRepairResult:
+    capture_json_path: Path
+    snapshot_dir: Path
+    repaired_post_count: int
+    repaired_comment_count: int
 
 
 async def capture_reddit_threads(
@@ -452,6 +493,7 @@ def merge_captured_posts(posts: list[ManualImportPost]) -> list[ManualImportPost
             update={
                 "score": post.score if (post.score or 0) > (existing.score or 0) else existing.score,
                 "num_comments": post.num_comments if (post.num_comments or 0) > (existing.num_comments or 0) else existing.num_comments,
+                "created_utc": post.created_utc if (post.created_utc or 0) > (existing.created_utc or 0) else existing.created_utc,
                 "selftext": existing.selftext or post.selftext,
                 "comments": merged_comments,
                 "source_queries": _dedupe_preserve_order([*existing.source_queries, *post.source_queries]),
@@ -462,6 +504,58 @@ def merge_captured_posts(posts: list[ManualImportPost]) -> list[ManualImportPost
             }
         )
     return list(merged.values())
+
+
+def repair_capture_timestamps(
+    *,
+    capture_json_path: Path,
+    snapshot_dir: Path | None = None,
+) -> CaptureTimestampRepairResult:
+    resolved_snapshot_dir = snapshot_dir or capture_json_path.with_suffix("")
+    if not capture_json_path.exists():
+        raise FileNotFoundError(f"capture json not found: {capture_json_path}")
+    if not resolved_snapshot_dir.exists():
+        raise FileNotFoundError(f"snapshot directory not found: {resolved_snapshot_dir}")
+
+    payload = json.loads(capture_json_path.read_text(encoding="utf-8"))
+    posts = payload.get("posts")
+    if not isinstance(posts, list):
+        raise ValueError("capture json must contain a top-level posts list")
+
+    post_timestamps, comment_timestamps = _extract_timestamp_maps_from_snapshot_dir(resolved_snapshot_dir)
+    repaired_post_count = 0
+    repaired_comment_count = 0
+
+    for post in posts:
+        if not isinstance(post, dict):
+            continue
+        post_id = str(post.get("id") or "").strip()
+        if post_id and post.get("created_utc") in {None, ""} and post_id in post_timestamps:
+            post["created_utc"] = post_timestamps[post_id]
+            repaired_post_count += 1
+
+        comments = post.get("comments")
+        if not isinstance(comments, list):
+            continue
+        for comment in comments:
+            if not isinstance(comment, dict):
+                continue
+            comment_id = str(comment.get("id") or "").strip()
+            if (
+                comment_id
+                and comment.get("created_utc") in {None, ""}
+                and comment_id in comment_timestamps
+            ):
+                comment["created_utc"] = comment_timestamps[comment_id]
+                repaired_comment_count += 1
+
+    _atomic_write_json(capture_json_path, payload)
+    return CaptureTimestampRepairResult(
+        capture_json_path=capture_json_path,
+        snapshot_dir=resolved_snapshot_dir,
+        repaired_post_count=repaired_post_count,
+        repaired_comment_count=repaired_comment_count,
+    )
 
 
 def resolve_capture_session_paths(
@@ -768,3 +862,72 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 def _safe_name(value: str) -> str:
     return "".join(character.lower() if character.isalnum() else "-" for character in value).strip("-") or "value"
+
+
+def _extract_timestamp_maps_from_snapshot_dir(snapshot_dir: Path) -> tuple[dict[str, float], dict[str, float]]:
+    post_timestamps: dict[str, float] = {}
+    comment_timestamps: dict[str, float] = {}
+    for path in sorted(snapshot_dir.glob("thread-*.html")):
+        html = path.read_text(encoding="utf-8")
+        post_id, post_created_utc = _extract_post_timestamp_from_html(html)
+        if post_id and post_created_utc is not None:
+            post_timestamps[post_id] = post_created_utc
+        for comment_id, comment_created_utc in _extract_comment_timestamps_from_html(html).items():
+            comment_timestamps[comment_id] = comment_created_utc
+    return post_timestamps, comment_timestamps
+
+
+def _extract_post_timestamp_from_html(html: str) -> tuple[str | None, float | None]:
+    post_tag_match = re.search(
+        r"<shreddit-post\b[^>]*>",
+        html,
+        re.IGNORECASE,
+    )
+    if post_tag_match:
+        post_tag = post_tag_match.group(0)
+        id_match = re.search(r'\bid="t3_([^"]+)"', post_tag, re.IGNORECASE)
+        created_match = re.search(r'\bcreated-timestamp="([^"]+)"', post_tag, re.IGNORECASE)
+        if id_match and created_match:
+            created = _coerce_float(created_match.group(1))
+            if created is None:
+                created = _coerce_iso_datetime_to_unix_seconds(created_match.group(1))
+            return id_match.group(1), created
+
+    screenview_match = re.search(
+        r'"post":\{"id":"t3_([^"]+)".*?"created_timestamp":(\d+)',
+        html,
+        re.IGNORECASE,
+    )
+    if screenview_match:
+        created = _coerce_float(screenview_match.group(2))
+        if created is None:
+            return screenview_match.group(1), None
+        if created > 1e12:
+            created /= 1000.0
+        return screenview_match.group(1), created
+    return None, None
+
+
+def _extract_comment_timestamps_from_html(html: str) -> dict[str, float]:
+    timestamps: dict[str, float] = {}
+    for match in re.finditer(
+        r'<shreddit-comment\b[^>]*\bcreated="([^"]+)"[^>]*\bthingid="t1_([^"]+)"',
+        html,
+        re.IGNORECASE,
+    ):
+        created = _coerce_float(match.group(1))
+        if created is None:
+            created = _coerce_iso_datetime_to_unix_seconds(match.group(1))
+        if created is not None:
+            timestamps[match.group(2)] = created
+    return timestamps
+
+
+def _coerce_iso_datetime_to_unix_seconds(value: Any) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None

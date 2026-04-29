@@ -70,6 +70,8 @@ def cluster_run_posts(
         cluster_count=len(clusters),
         strongest_cluster_id=strongest_cluster.cluster_id if strongest_cluster else None,
         strongest_post_ids=strongest_cluster.post_ids if strongest_cluster else [],
+        valid_cluster_count=sum(1 for cluster in clusters if cluster.minimum_theme_size_met),
+        invalid_cluster_count=sum(1 for cluster in clusters if not cluster.minimum_theme_size_met),
         clusters=clusters,
     )
     store = ArtifactStore(run_dir)
@@ -275,6 +277,14 @@ def _build_theme_cluster(
     )
     total_comments = sum(member.candidate.num_comments or 0 for member in members)
     cohesion = _cluster_cohesion(members)
+    source_thread_urls = _unique_urls(member.candidate.url for member in members)
+    source_subreddits = _unique_values(member.candidate.subreddit for member in members)
+    opportunity_score = _cluster_opportunity_score(
+        size=len(members),
+        cohesion=cohesion,
+        cross_subreddit_count=len(source_subreddits),
+        average_post_score=average_score,
+    )
     return ThemeCluster(
         cluster_id=f"cluster-{cluster_index}",
         label=label,
@@ -285,6 +295,12 @@ def _build_theme_cluster(
         top_terms=top_terms,
         member_ranks=[member.rank for member in members],
         cohesion_score=round(cohesion, 3),
+        source_thread_urls=source_thread_urls,
+        source_subreddits=source_subreddits,
+        cross_subreddit_count=len(source_subreddits),
+        minimum_theme_size_met=len(members) >= 5,
+        opportunity_score=round(opportunity_score, 3),
+        opportunity_recommendation=_cluster_opportunity_recommendation(opportunity_score),
     )
 
 
@@ -325,6 +341,52 @@ def _normalize_token(token: str) -> str:
     if token.endswith("s") and len(token) > 4:
         return token[:-1]
     return token
+
+
+def _unique_urls(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        normalized = value.strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def _unique_values(values) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for value in values:
+        normalized = str(value).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def _cluster_opportunity_score(
+    *,
+    size: int,
+    cohesion: float,
+    cross_subreddit_count: int,
+    average_post_score: float,
+) -> float:
+    frequency_score = min(size / 5.0, 1.5)
+    cohesion_score = min(max(cohesion, 0.0) * 1.5, 1.5)
+    breadth_score = min(cross_subreddit_count / 2.0, 1.0)
+    quality_score = min(max(average_post_score, 0.0) / 6.0, 1.0)
+    return frequency_score + cohesion_score + breadth_score + quality_score
+
+
+def _cluster_opportunity_recommendation(score: float) -> str:
+    if score >= 4.0:
+        return "strong"
+    if score >= 2.5:
+        return "moderate"
+    return "weak"
 
 
 def _load_theme_summary(run_dir: Path) -> ThemeSummaryArtifact:
